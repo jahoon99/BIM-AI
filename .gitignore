@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments (파이썬 가상환경 폴더)
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE / Editor (VS Code 설정 파일)
+.vscode/
+
+# OS generated files (OS 시스템 파일)
+.DS_Store
+Thumbs.db
+
+# Security (사내 프로젝트 필수 보안 파일: API 키, DB 접속 정보 등)
+.env
+
+# Google Cloud Service Account Key (보안 인증 파일)
+*.json
+service_account_key.json
+
+# Local Vector DB Folder (대용량 파일)
+999_vector_db/
