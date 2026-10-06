@@ -52,4 +52,4 @@ Thumbs.db
 service_account_key.json
 
 # Local Vector DB Folder (대용량 파일)
-999_vector_db/
+vector_db/
