@@ -17,6 +17,7 @@ from pptx import Presentation
 import openpyxl
 
 def extract_documents_from_file(temp_path, ext, base_meta):
+    """파일 확장자별로 텍스트를 추출하여 LangChain Document 리스트로 반환합니다."""
     docs = []
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
 
@@ -98,9 +99,10 @@ def ingest_manuals_to_chroma():
 
     print(f"1. 현재 Vector DB에 등록된 문서 파일 수: {len(existing_files)}개")
 
-    # 2. 구글 드라이브 스캔
+    # 2. 구글 드라이브 스캔 (복사 시 마크다운 링크 변환을 방지하기 위해 문자열 분리 결합)
+    drive_scope = "https://" + "www.googleapis.com/auth/drive.readonly"
     creds = Credentials.from_service_account_file(
-        key_path, scopes=['https://www.googleapis.com/auth/drive.readonly']
+        key_path, scopes=[drive_scope]
     )
     drive_service = build('drive', 'v3', credentials=creds)
 
@@ -114,7 +116,7 @@ def ingest_manuals_to_chroma():
     drive_files = results.get('files', [])
     print(f"2. 구글 드라이브 매뉴얼 폴더 내 전체 파일 수: {len(drive_files)}개\n")
 
-    # [핵심 로직] 삭제된 파일(Orphan Data) 감지 및 Vector DB에서 제거
+    # 3. 삭제된 파일(Orphan Data) 감지 및 Vector DB에서 제거
     drive_file_ids = {file.get('id') for file in drive_files}
     deleted_ids = set(existing_files.keys()) - drive_file_ids
     deleted_count = 0
@@ -124,10 +126,10 @@ def ingest_manuals_to_chroma():
         for del_id in deleted_ids:
             collection.delete(where={"file_id": del_id})
             deleted_count += 1
-            print(f" - Vector DB 삭제 완료 (ID: {del_id})")
+            print(" - Vector DB 내 삭제된 문서 데이터 정리 완료")
         print()
 
-    # 3. 추가 및 수정 로직
+    # 4. 추가 및 수정 로직
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
         google_api_key=gemini_api_key
