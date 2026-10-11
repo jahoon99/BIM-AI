@@ -50,27 +50,36 @@ def get_cached_sheet_records(force_refresh=False):
     return _SHEET_CACHE["data"]
 
 
-def search_manuals(query, top_k=3):
-    """질문을 벡터화하여 ChromaDB에서 관련 문서 조각을 찾습니다."""
+def def search_manuals(query, top_k=7):
+    """질문을 벡터화하여 ChromaDB에서 다중 문서 비교가 가능하도록 상위 7개 조각을 찾습니다."""
     if not collection:
         return "학습된 매뉴얼 데이터가 없습니다."
     
     query_vector = embeddings.embed_query(query)
-    results = collection.query(query_embeddings=[query_vector], n_results=top_k)
+    results = collection.query(
+        query_embeddings=[query_vector], 
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"]
+    )
     
     context_list = []
     if results and results['documents'] and results['documents'][0]:
         for i, doc in enumerate(results['documents'][0]):
             meta = results['metadatas'][0][i]
+            dist = results['distances'][0][i] if 'distances' in results and results['distances'] else 0.0
+            
             file_name = meta.get("file_name", "알 수 없는 파일")
             loc = meta.get("location", "")
             link = meta.get("drive_link", "")
             
-            chunk_info = f"[{file_name} ({loc})]\n내용: {doc}\n원본 링크: {link}"
+            chunk_info = (
+                f"--- [문서 조각 #{i+1} | 출처: {file_name} ({loc}) | 벡터거리: {dist:.3f}] ---\n"
+                f"내용: {doc}\n"
+                f"원본 링크: {link}"
+            )
             context_list.append(chunk_info)
             
     return "\n\n".join(context_list) if context_list else "관련 매뉴얼 내용을 찾을 수 없습니다."
-
 
 def extract_keywords_with_llm(query):
     """사람이 만든 불용어 사전 대신, LLM이 직접 핵심 명사와 한/영 유의어를 추출합니다."""
@@ -155,24 +164,51 @@ def search_bim_files(query):
     return "\n".join(result_list)
 
 
-def get_ai_response(user_query, return_context=False):
-    """두 저장소의 검색 결과를 종합하여 최종 답변을 생성합니다."""
-    manual_context = search_manuals(user_query)
-    file_context = search_bim_files(user_query)
+def get_ai_response(user_query, chat_history=None, return_context=False):
+    """다중 문서 교차 비교 및 마크다운 표(Table) 구조화 출력이 강화된 응답 생성 함수입니다."""
+    # 1. 이전 대화 기록 텍스트 구성 (최근 6개 메시지 = 3턴 참조)
+    history_text = "이전 대화 없음"
+    if chat_history:
+        recent_msgs = chat_history[-6:]
+        formatted_msgs = []
+        for msg in recent_msgs:
+            role_kr = "사용자" if msg["role"] == "user" else "AI"
+            formatted_msgs.append(f"{role_kr}: {msg['content']}")
+        history_text = "\n".join(formatted_msgs)
+
+    # 2. 대명사/짧은 질문일 경우 직전 질문 키워드 결합
+    search_query = user_query
+    if chat_history and len(user_query) < 15:
+        last_user_msgs = [m["content"] for m in chat_history if m["role"] == "user"]
+        if last_user_msgs:
+            search_query = f"{last_user_msgs[-1]} {user_query}"
+
+    manual_context = search_manuals(search_query, top_k=7)
+    file_context = search_bim_files(search_query)
     
-    prompt = f"""당신은 사내 BIM 및 건설 데이터 관리 AI 어시스턴트입니다.
-사용자의 질문에 대해 아래 제공된 [매뉴얼/보고서 지식]과 [BIM 파일 목록]을 확인하여 답변하세요.
+    # 3. 다중 문서 합성 및 표(Table) 출력 특화 프롬프트
+    prompt = f"""당신은 사내 BIM 및 건설 데이터 관리 전문 AI 어시스턴트입니다.
+아래의 [이전 대화 기록]을 참고하여 문맥을 파악하고, 제공된 [매뉴얼/보고서 지식]과 [BIM 파일 목록]만을 바탕으로 정확하게 답변하세요.
 
-중요 답변 규칙:
+[핵심 사실 및 제한 규칙]
 1. [매뉴얼/보고서 지식]과 [BIM 파일 목록] 두 곳 모두에서 질문과 관련된 정보를 전혀 찾을 수 없을 때만 '제공된 문서에서 찾을 수 없습니다.'라고 답변하세요.
-2. 만약 [매뉴얼/보고서 지식]에는 관련 내용이 없더라도, [BIM 파일 목록]에 사용자가 찾는 파일 정보가 존재한다면 반드시 해당 파일의 정보와 다운로드 링크를 안내하세요. (반대의 경우도 마찬가지입니다.)
-3. 사용자가 한글 발음(예: '티바')이나 동의어로 질문하더라도 [BIM 파일 목록]의 영문 파일명(예: 'BF-T-Bar.rfa')이나 설명과 의미가 통한다면 정답으로 매칭하여 안내하세요.
-4. 매뉴얼/보고서의 내용을 인용할 때는 괄호로 파일명과 위치를 명시하고 원본 링크를 첨부하세요.
-5. 제공된 데이터에 없는 사실을 추측하여 지어내지 마세요.
+2. 한쪽 저장소에라도 관련 정보가 있다면 절대 거절하지 말고 해당 정보를 안내하세요.
+3. 제공된 데이터에 없는 내용을 추측하거나 외부 지식을 섞어 지어내지 마세요.
 
-사용자 질문: {user_query}
+[다중 문서 비교 및 표(Table) 출력 규칙]
+1. 검토사항 목록, 여러 개의 항목 정리, 두 가지 이상의 문서/가이드북 비교, 또는 2개 이상의 BIM 파일이 검색된 경우에는 반드시 **마크다운 표(Markdown Table)**를 사용하여 한눈에 비교할 수 있도록 구조화하세요.
+   - 매뉴얼/보고서 정리 표 권장 컬럼: | 구분/항목 | 상세 내용 및 검토사항 | 출처 (파일명 및 위치) |
+   - BIM 파일 안내 표 권장 컬럼: | 파일명 | 분류 | 버전 | 상세 설명 | 다운로드 링크 |
+2. 서로 다른 문서(예: PDF 보고서와 XLSX 엑셀 시트, 또는 서로 다른 가이드북)에서 관련된 내용이 함께 검색되었다면, 각 문서의 내용을 누락 없이 교차 비교하여 종합적으로 서술하세요.
+3. 링크를 표기할 때는 사용자가 클릭할 수 있도록 `[원본 보기](링크주소)` 또는 `[다운로드](링크주소)` 형태의 마크다운 하이퍼링크 문법을 적용하세요.
+4. 표 아래에는 핵심 요약 및 실무적 참고사항을 불릿 포인트(-)로 간결하게 덧붙이고, 인용된 매뉴얼들의 원본 링크를 하단에 정리해 주세요.
 
-[매뉴얼/보고서 지식]
+[이전 대화 기록]
+{history_text}
+
+현재 사용자 질문: {user_query}
+
+[매뉴얼/보고서 지식 (상위 7개 조각)]
 {manual_context}
 
 [BIM 파일 목록]
