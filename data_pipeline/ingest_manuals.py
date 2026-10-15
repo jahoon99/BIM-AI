@@ -155,11 +155,12 @@ def get_all_files_recursively(drive_service, folder_id):
 
 
 def ingest_manuals_to_chroma():
-    print("=== [Step 1-B: 매뉴얼 및 검토보고서 Vector DB 완전 동기화(초고속화 적용) 시작] ===\n")
+    print("=== [Step 1-B: 매뉴얼 및 BIM 엑셀 문서 Vector DB 이중 연동 동기화 시작] ===\n")
 
     load_dotenv()
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     manual_folder_id = os.getenv("MANUAL_FOLDER_ID")
+    bim_folder_id = os.getenv("BIM_FILE_FOLDER_ID")  # [추가] BIM 파일 폴더 ID 로드
     chroma_path = os.getenv("CHROMA_DB_PATH")
     gemini_api_key = os.getenv("GOOGLE_API_KEY")
 
@@ -178,10 +179,18 @@ def ingest_manuals_to_chroma():
     creds = Credentials.from_service_account_file(key_path, scopes=[drive_scope])
     drive_service = build('drive', 'v3', credentials=creds)
 
-    drive_files = get_all_files_recursively(drive_service, manual_folder_id)
-    print(f"2. 구글 드라이브 매뉴얼 폴더(하위 폴더 포함) 내 전체 파일 수: {len(drive_files)}개\n")
+    # 2. [핵심 수정] 매뉴얼 폴더와 BIM 폴더 양쪽을 모두 스캔하여 파일 목록 병합
+    print("2. 구글 드라이브 스캔 중 (매뉴얼 폴더 및 BIM 파일 폴더 동시 탐색)...")
+    manual_files = get_all_files_recursively(drive_service, manual_folder_id)
+    bim_files = get_all_files_recursively(drive_service, bim_folder_id)
+    
+    # 두 폴더에서 스캔된 파일들을 하나의 딕셔너리로 합쳐 중복 제거
+    unique_drive_files = {f.get('id'): f for f in manual_files + bim_files}
+    drive_files = list(unique_drive_files.values())
+    
+    print(f" -> 총 {len(drive_files)}개 파일 스캔 완료 (지원 포맷 필터링 전)\n")
 
-    drive_file_ids = {file.get('id') for file in drive_files}
+    drive_file_ids = set(unique_drive_files.keys())
     deleted_ids = set(existing_files.keys()) - drive_file_ids
     deleted_count = 0
 
@@ -222,6 +231,7 @@ def ingest_manuals_to_chroma():
             ext = 'docx'
             export_mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
+        # .rfa, .rvt 등 지원하지 않는 파일은 여기서 모두 안전하게 걸러짐
         if ext not in supported_extensions:
             continue
 
@@ -269,7 +279,6 @@ def ingest_manuals_to_chroma():
 
                 print(f"   -> 추출된 덩어리 수: {len(docs)}개 (서버 전송 시작...)")
                 
-                # 수정한 안전장치 함수 적용
                 vectors = embed_with_rate_limit(embeddings, texts, batch_size=100)
                 
                 collection.add(
