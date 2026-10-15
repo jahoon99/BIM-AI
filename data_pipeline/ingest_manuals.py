@@ -18,10 +18,10 @@ from pptx import Presentation
 import openpyxl
 
 def extract_documents_from_file(temp_path, ext, base_meta):
-    """파일 확장자별로 텍스트를 추출하여 LangChain Document 리스트로 반환합니다."""
+    """파일 확장자별로 텍스트를 추출합니다. 청크 크기를 대폭 키워 API 호출을 최소화합니다."""
     docs = []
-    # 청크 크기를 1000자로 조금 넓혀 전체 조각(Chunk) 개수를 줄임으로써 API 할당량 절약
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    # [최적화 1] 1000 -> 2500으로 키워 조각 개수를 절반 이하로 줄임 (일일 한도 절약)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
 
     if ext == 'pdf':
         reader = PdfReader(temp_path)
@@ -67,10 +67,10 @@ def extract_documents_from_file(temp_path, ext, base_meta):
                 continue
             headers = [str(h).strip() if h is not None else f"열{idx+1}" for idx, h in enumerate(rows[0])]
             
-            # [최적화] 엑셀 행이 많을 때 API 제한(분당 100회)에 걸리지 않도록 10행 단위로 묶어서 1개 청크로 생성
             batch_rows_text = []
             start_row_num = 2
             
+            # [최적화 2] 엑셀은 10행 -> 20행 단위로 묶어 조각 개수를 더욱 감축
             for r_idx, row in enumerate(rows[1:], start=2):
                 row_items = []
                 for h, val in zip(headers, row):
@@ -79,8 +79,7 @@ def extract_documents_from_file(temp_path, ext, base_meta):
                 if row_items:
                     batch_rows_text.append(f"({r_idx}행) " + " | ".join(row_items))
                 
-                # 10개 행이 모이거나 마지막 행에 도달하면 하나의 Document로 묶음
-                if len(batch_rows_text) >= 10 or r_idx == len(rows):
+                if len(batch_rows_text) >= 20 or r_idx == len(rows):
                     if batch_rows_text:
                         combined_text = f"[{sheet} 시트 {start_row_num}~{r_idx}행]\n" + "\n".join(batch_rows_text)
                         meta = base_meta.copy()
@@ -92,11 +91,13 @@ def extract_documents_from_file(temp_path, ext, base_meta):
     return docs
 
 
-def embed_with_rate_limit(embeddings, texts, batch_size=40):
-    """무료 API의 분당 100회 제한(429 에러)을 회피하기 위해 분할 전송 및 자동 대기 재시도를 수행합니다."""
+def embed_with_rate_limit(embeddings, texts, batch_size=100):
+    """무한 루프(Hang) 방지 및 API 효율 극대화를 위한 임베딩 함수"""
     all_vectors = []
     total = len(texts)
+    max_retries = 3  # [안전장치] 최대 3회 재시도 후 에러를 내뿜고 강제 종료
     
+    # [최적화 3] 한 번에 최대치인 100개씩 묶어서 구글 서버로 전송
     for i in range(0, total, batch_size):
         batch = texts[i : i + batch_size]
         retry_count = 0
@@ -105,16 +106,25 @@ def embed_with_rate_limit(embeddings, texts, batch_size=40):
             try:
                 vectors = embeddings.embed_documents(batch)
                 all_vectors.extend(vectors)
-                # 배치 간 기본 안전 간격 (2초 대기)
+                
+                # [안심 기능] 터미널에 실시간 진행률 표시
+                print(f"     ... 임베딩 진행률: {min(i + batch_size, total)} / {total} 조각 완료")
+                
                 if i + batch_size < total:
-                    time.sleep(2)
+                    time.sleep(2) 
                 break
             except Exception as e:
                 err_msg = str(e)
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     retry_count += 1
-                    wait_sec = 35  # 무료 할당량 초기화 대기 시간
-                    print(f"   -> [API 속도 조절] 분당 무료 할당량(100회) 도달. {wait_sec}초 대기 후 이어서 진행합니다... (재시도 {retry_count}회)")
+                    
+                    if retry_count > max_retries:
+                        print("\n[치명적 오류] 일일 무료 할당량(Daily Quota)이 고갈되었거나 네트워크가 차단되었습니다.")
+                        print(" -> 무한 루프를 방지하기 위해 작업을 강제 종료합니다. (수 시간 뒤 또는 내일 다시 시도하세요)")
+                        raise e  # 무한루프를 끊고 강제 에러 발생
+                        
+                    wait_sec = 60  # 1분 대기
+                    print(f"   -> [API 할당량 초과] {wait_sec}초 대기 후 재시도... (재시도 {retry_count}/{max_retries}회)")
                     time.sleep(wait_sec)
                 else:
                     raise e
@@ -123,7 +133,6 @@ def embed_with_rate_limit(embeddings, texts, batch_size=40):
 
 
 def get_all_files_recursively(drive_service, folder_id):
-    """지정된 폴더와 그 안의 모든 하위 폴더를 추적하여 파일 목록을 가져옵니다."""
     all_files = []
     folders_to_scan = [folder_id]
 
@@ -146,7 +155,7 @@ def get_all_files_recursively(drive_service, folder_id):
 
 
 def ingest_manuals_to_chroma():
-    print("=== [Step 1-B: 매뉴얼 및 검토보고서 Vector DB 완전 동기화(할당량 제어 적용) 시작] ===\n")
+    print("=== [Step 1-B: 매뉴얼 및 검토보고서 Vector DB 완전 동기화(초고속화 적용) 시작] ===\n")
 
     load_dotenv()
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -214,7 +223,6 @@ def ingest_manuals_to_chroma():
             export_mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
         if ext not in supported_extensions:
-            print(f" - [스킵] '{file_name}' (지원하지 않는 포맷: {ext or mime_type})")
             continue
 
         is_update = False
@@ -227,7 +235,7 @@ def ingest_manuals_to_chroma():
                 collection.delete(where={"file_id": file_id})
                 is_update = True
         else:
-            print(f" - [신규 처리] '{file_name}' 다운로드 및 텍스트 추출 중...")
+            print(f" - [신규 처리] '{file_name}' 텍스트 추출 중...")
 
         try:
             if export_mime:
@@ -251,6 +259,7 @@ def ingest_manuals_to_chroma():
                 "drive_link": file.get('webViewLink', ''),
                 "modified_time": drive_mod_time
             }
+            
             docs = extract_documents_from_file(temp_path, ext, base_meta)
 
             if docs:
@@ -258,9 +267,10 @@ def ingest_manuals_to_chroma():
                 metadatas = [doc.metadata for doc in docs]
                 ids = [f"{file_id}_chunk_{i}" for i in range(len(docs))]
 
-                print(f"   -> 추출된 조각 수: {len(docs)}개 (임베딩 시작...)")
-                # [핵심 수정] 속도 제한 및 자동 재시도가 적용된 임베딩 함수 호출
-                vectors = embed_with_rate_limit(embeddings, texts, batch_size=40)
+                print(f"   -> 추출된 덩어리 수: {len(docs)}개 (서버 전송 시작...)")
+                
+                # 수정한 안전장치 함수 적용
+                vectors = embed_with_rate_limit(embeddings, texts, batch_size=100)
                 
                 collection.add(
                     ids=ids,
@@ -272,14 +282,12 @@ def ingest_manuals_to_chroma():
                     updated_count += 1
                 else:
                     new_count += 1
-                print(f"   -> 완료: '{file_name}' ({len(docs)}개 조각 적재 성공)")
-                # 다음 파일로 넘어가기 전 3초 호흡 조절
-                time.sleep(3)
+                print(f"   -> 완료: '{file_name}' (DB 적재 성공)\n")
             else:
-                print(f"   -> [경고] '{file_name}'에서 추출된 텍스트가 없습니다.")
+                print(f"   -> [경고] '{file_name}'에서 읽을 수 있는 텍스트가 없습니다.\n")
 
         except Exception as e:
-            print(f"   -> [오류 발생] '{file_name}' 처리 중 에러: {e}")
+            print(f"   -> [오류 발생] '{file_name}' 처리 실패: {e}\n")
 
         finally:
             if 'temp_path' in locals() and os.path.exists(temp_path):
