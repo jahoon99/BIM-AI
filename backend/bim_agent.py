@@ -50,17 +50,35 @@ def get_cached_sheet_records(force_refresh=False):
     return _SHEET_CACHE["data"]
 
 
-def def search_manuals(query, top_k=7):
-    """질문을 벡터화하여 ChromaDB에서 다중 문서 비교가 가능하도록 상위 7개 조각을 찾습니다."""
+def get_indexed_manual_list():
+    """현재 ChromaDB에 학습되어 있는 전체 매뉴얼/보고서의 파일명 목록을 반환합니다."""
+    if not collection:
+        return []
+    try:
+        data = collection.get(include=["metadatas"])
+        names = {m.get("file_name") for m in data.get("metadatas", []) if m and m.get("file_name")}
+        return sorted(list(names))
+    except Exception:
+        return []
+
+
+def search_manuals(query, top_k=7, target_manual=None):
+    """질문을 벡터화하여 ChromaDB에서 검색하되, 특정 문서가 지정되면 해당 문서 내에서만 검색합니다."""
     if not collection:
         return "학습된 매뉴얼 데이터가 없습니다."
     
     query_vector = embeddings.embed_query(query)
-    results = collection.query(
-        query_embeddings=[query_vector], 
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"]
-    )
+    
+    query_kwargs = {
+        "query_embeddings": [query_vector],
+        "n_results": top_k,
+        "include": ["documents", "metadatas", "distances"]
+    }
+    # 사용자가 특정 문서를 지정한 경우 Metadata Where 필터 적용
+    if target_manual and target_manual != "전체 문서 검색":
+        query_kwargs["where"] = {"file_name": target_manual}
+        
+    results = collection.query(**query_kwargs)
     
     context_list = []
     if results and results['documents'] and results['documents'][0]:
@@ -114,7 +132,6 @@ def extract_keywords_with_llm(query):
 
 def search_bim_files(query):
     """캐싱된 시트 데이터를 바탕으로 빠르게 BIM 파일을 검색합니다."""
-    # 구글 서버 대신 로컬 메모리 캐시에서 0.001초 만에 데이터 로드
     all_records = get_cached_sheet_records()
     
     if not all_records:
@@ -124,7 +141,11 @@ def search_bim_files(query):
     if len(all_records) <= 100:
         result_list = [f"[전체 BIM 파일 목록 직접 스캔 모드 (총 {len(all_records)}개 / 메모리 캐시 적용됨)]"]
         for f in all_records:
-            file_info = f"- 파일명: {f.get('file_name')} (분류: {f.get('category')})\n  설명: {f.get('description')}\n  다운로드: {f.get('drive_link')}"
+            file_info = (
+                f"- 파일명: {f.get('file_name')} | 분류: {f.get('category')} | 버전: {f.get('software_version')}\n"
+                f"  설명: {f.get('description')}\n"
+                f"  다운로드: {f.get('drive_link')}"
+            )
             result_list.append(file_info)
         return "\n".join(result_list)
 
@@ -158,13 +179,17 @@ def search_bim_files(query):
         
     result_list = [f"[AI 자동 확장 검색어: {', '.join(clean_keywords)} / 메모리 캐시 적용됨]"]
     for score, f in scored_files[:10]:
-        file_info = f"- 파일명: {f['file_name']} (분류: {f['category']} / 점수: {score}점)\n  설명: {f['description']}\n  다운로드: {f['drive_link']}"
+        file_info = (
+            f"- 파일명: {f.get('file_name')} | 분류: {f.get('category')} | 버전: {f.get('software_version')} | 점수: {score}점\n"
+            f"  설명: {f.get('description')}\n"
+            f"  다운로드: {f.get('drive_link')}"
+        )
         result_list.append(file_info)
         
     return "\n".join(result_list)
 
 
-def get_ai_response(user_query, chat_history=None, return_context=False):
+def get_ai_response(user_query, chat_history=None, return_context=False, target_manual=None):
     """다중 문서 교차 비교 및 마크다운 표(Table) 구조화 출력이 강화된 응답 생성 함수입니다."""
     # 1. 이전 대화 기록 텍스트 구성 (최근 6개 메시지 = 3턴 참조)
     history_text = "이전 대화 없음"
@@ -183,7 +208,7 @@ def get_ai_response(user_query, chat_history=None, return_context=False):
         if last_user_msgs:
             search_query = f"{last_user_msgs[-1]} {user_query}"
 
-    manual_context = search_manuals(search_query, top_k=7)
+    manual_context = search_manuals(search_query, top_k=7, target_manual=target_manual)
     file_context = search_bim_files(search_query)
     
     # 3. 다중 문서 합성 및 표(Table) 출력 특화 프롬프트

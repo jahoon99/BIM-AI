@@ -5,32 +5,23 @@ import io
 from contextlib import redirect_stdout
 from dotenv import load_dotenv
 
-# 1. 상위 폴더 경로 추가 및 환경변수 로드
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 load_dotenv()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1234")
 
-from backend.bim_agent import get_ai_response, get_cached_sheet_records
+from backend.bim_agent import get_ai_response, get_cached_sheet_records, get_indexed_manual_list
 from data_pipeline.sync_bim_metadata import sync_drive_to_sheets
 from data_pipeline.ingest_manuals import ingest_manuals_to_chroma
 
-# 2. 웹 페이지 기본 설정 (표 조회를 위해 layout을 wide 또는 centered 선택 가능)
-st.set_page_config(
-    page_title="BIM 데이터 어시스턴트",
-    layout="wide"
-)
+st.set_page_config(page_title="BIM 데이터 어시스턴트", layout="wide")
 
-# 3. 좌측 사이드바: 일반 메뉴 및 관리자 인증 제어판
 with st.sidebar:
     st.header("시스템 제어판")
-    
     if st.button("대화 내용 초기화", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
         
     st.divider()
-    
-    # 관리자 잠금 영역
     st.subheader("관리자 데이터 동기화")
     admin_input = st.text_input("관리자 비밀번호 입력", type="password", placeholder="비밀번호를 입력하세요")
     
@@ -76,7 +67,6 @@ with st.sidebar:
     else:
         st.caption("데이터 동기화 기능은 관리자 암호 입력 후 활성화됩니다.")
 
-# 4. 메인 화면 헤더 및 탭 구성
 st.title("BIM 데이터 어시스턴트")
 st.caption("사내 매뉴얼, 검토보고서 검색 및 구글 드라이브 내 BIM 패밀리를 찾아드립니다.")
 
@@ -84,15 +74,38 @@ tab_chat, tab_catalog = st.tabs(["AI 검색 챗봇", "전체 BIM 파일 카탈�
 
 # --- [탭 1: AI 검색 챗봇] ---
 with tab_chat:
+    # [신규 기능] 현재 ChromaDB에 학습된 문서 목록 확인 및 타겟 필터링
+    manual_list = get_indexed_manual_list()
+    col_filter, col_info = st.columns([2, 3])
+    with col_filter:
+        selected_manual = st.selectbox(
+            "매뉴얼 검색 범위 지정 (Metadata Filter)",
+            options=["전체 문서 검색"] + manual_list
+        )
+    with col_info:
+        st.caption(f"현재 Vector DB에 학습된 매뉴얼/보고서 수: **{len(manual_list)}개**")
+        if manual_list:
+            st.caption("등록된 문서: " + ", ".join(manual_list))
+
+    st.divider()
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    for message in st.session_state.messages:
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            # AI 답변마다 마크다운 파일(.md)로 내려받을 수 있는 버튼 제공
+            if message["role"] == "assistant":
+                st.download_button(
+                    label="답변 내용 다운로드 (.md)",
+                    data=message["content"].encode("utf-8-sig"),
+                    file_name=f"BIM_AI_답변_{idx}.md",
+                    mime="text/markdown",
+                    key=f"dl_{idx}"
+                )
 
-    if prompt := st.chat_input("질문을 입력하세요 (예: T-Bar 패밀리 파일 찾아줘)"):
-        # 이전 대화 기록 복사 (현재 질문 추가 전 상태)
+    if prompt := st.chat_input("질문을 입력하세요 (예: 키움 검토보고서 주요 지적사항 표로 정리해줘)"):
         previous_history = list(st.session_state.messages)
         
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -105,11 +118,21 @@ with tab_chat:
                     response, manual_ctx, file_ctx = get_ai_response(
                         prompt, 
                         chat_history=previous_history, 
-                        return_context=True
+                        return_context=True,
+                        target_manual=selected_manual
                     )
                     st.markdown(response)
                     
+                    st.download_button(
+                        label="답변 내용 다운로드 (.md)",
+                        data=response.encode("utf-8-sig"),
+                        file_name="BIM_AI_최신답변.md",
+                        mime="text/markdown",
+                        key="dl_latest"
+                    )
+                    
                     with st.expander("시스템 DB 검색 원본 결과 확인"):
+                        st.markdown(f"**[적용된 매뉴얼 필터: {selected_manual}]**")
                         st.markdown("**[구글 시트 (BIM 파일) 검색 결과]**")
                         st.text(file_ctx)
                         st.markdown("**[ChromaDB (매뉴얼) 검색 결과]**")
@@ -127,14 +150,12 @@ with tab_catalog:
     try:
         records = get_cached_sheet_records()
         if records:
-            # 카테고리별 필터링 선택창 제공
             categories = sorted(list({str(r.get("category", "미분류")) for r in records if r.get("category")}))
             selected_cat = st.selectbox("분류(Category) 필터", ["전체 보기"] + categories)
             
             filtered_records = records if selected_cat == "전체 보기" else [r for r in records if r.get("category") == selected_cat]
             st.caption(f"조회된 파일 수: {len(filtered_records)}개")
             
-            # 표 형태로 깔끔하게 출력 (다운로드 링크는 클릭 가능한 하이퍼링크 컬럼으로 변환)
             st.dataframe(
                 filtered_records,
                 column_order=("file_name", "category", "extension", "software_version", "description", "drive_link", "updated_at"),
