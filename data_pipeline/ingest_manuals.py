@@ -1,11 +1,9 @@
 import os
 import io
-import math
 import re
 import time
 import hashlib
 import tempfile
-from collections import deque
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -21,18 +19,16 @@ import docx
 from pptx import Presentation
 import openpyxl
 
-# 최소 유효 글자 수 기준 (표지, 간지, 단순 목차 등 노이즈 조각 제거를 통한 경량화)
 MIN_CHUNK_CHARS = 50
-# 엑셀 시트당 최대 허용 청크 수 (수천 행짜리 산출서로 인한 DB 비대화 및 속도 저하 방지)
 MAX_EXCEL_CHUNKS_PER_SHEET = 15
-MAX_EMBEDDING_TOKENS_PER_MINUTE = 20000
-EMBEDDING_RATE_WINDOW_SECONDS = 60
 
 def classify_doc_category(file_name, ext):
     """파일명과 확장자 규칙을 기반으로 사내 표준 문서 분류(doc_category)를 자동 지정합니다."""
     name_lower = file_name.lower()
-    if any(k in name_lower for k in ['양식', '템플릿', 'template', '표준']):
-        return "표준양식/템플릿"
+    if any(k in name_lower for k in ['양식', '템플릿', 'template', '표준', '매개변수', 'parameter', '조달청']):
+        return "표준양식/세팅기준"
+    elif any(k in name_lower for k in ['스펙', 'spec', '시방서', '재료', '마감']):
+        return "스펙북/자재기준"
     elif any(k in name_lower for k in ['검토보고', '보고서', 'report']):
         return "검토보고서"
     elif any(k in name_lower for k in ['검토리스트', '체크리스트', 'checklist', '검토목록']):
@@ -45,8 +41,28 @@ def classify_doc_category(file_name, ext):
         return "검토리스트/수량산출서" if ext == 'xlsx' else "기타기술문서"
 
 
+def detect_setup_topic(text):
+    """조각(Chunk)의 텍스트 내용을 분석하여 프로젝트 세팅 및 실무 활용 주제를 자동 태깅합니다."""
+    t_lower = text.lower()
+    topics = []
+    if any(k in t_lower for k in ['매개변수', '파라미터', 'parameter', '속성', '유형 특성', '인스턴스', 'guid']):
+        topics.append("매개변수/속성세팅")
+    if any(k in t_lower for k in ['뷰', 'view', '필터', 'filter', '가시성', '그래픽', '레벨', 'level', '그리드', 'grid', '시트', '탐색기']):
+        topics.append("뷰/그리드/레벨세팅")
+    if any(k in t_lower for k in ['재료', '재질', 'material', 'rgb', '색상', '스펙', '마감재', '열관류율']):
+        topics.append("재료/스펙세팅")
+    if any(k in t_lower for k in ['nwc', 'nwd', 'ifc', 'dwg', '내보내기', 'export', '업로드', '플러그인', '링크']):
+        topics.append("파일연동/내보내기세팅")
+    if any(k in t_lower for k in ['간섭', 'clash', '오류', '누락', '검토', '간격', '중복']):
+        topics.append("모델검토/QA기준")
+    if any(k in t_lower for k in ['산출수식', '물량', '수량', '단열', '콘크리트', '합계']):
+        topics.append("수량산출/적산기준")
+        
+    return ", ".join(topics) if topics else "일반내용/개요"
+
+
 def clean_and_filter_text(text):
-    """불필요한 연속 공백과 특수문자를 정리하고 유효 길이를 검사합니다."""
+    """불필요한 연속 공백과 줄바꿈을 정리합니다."""
     if not text:
         return ""
     cleaned = re.sub(r'[ \t]+', ' ', text)
@@ -54,105 +70,65 @@ def clean_and_filter_text(text):
     return cleaned
 
 
-def count_embedding_tokens(embeddings, texts):
-    response = embeddings.client.models.count_tokens(
-        model=embeddings.model,
-        contents=texts
-    )
-    if response.total_tokens is None:
-        raise RuntimeError("Gemini 토큰 수 응답에 total_tokens 값이 없습니다.")
-    return response.total_tokens
-
-
-def split_text_by_token_budget(text, embeddings, max_tokens):
-    if count_embedding_tokens(embeddings, [text]) <= max_tokens:
-        return [text]
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=0)
-    parts = splitter.split_text(text)
-    if len(parts) <= 1:
-        midpoint = len(text) // 2
-        if midpoint == 0:
-            raise ValueError("토큰 한도보다 큰 텍스트를 더 이상 분할할 수 없습니다.")
-        parts = [text[:midpoint], text[midpoint:]]
-
-    return [
-        part
-        for candidate in parts
-        for part in split_text_by_token_budget(candidate, embeddings, max_tokens)
-    ]
-
-
-class EmbeddingTokenRateLimiter:
-    def __init__(self):
-        self.usage = deque()
-        self.total_tokens = 0
-
-    def wait_for_capacity(self, token_count):
-        if token_count > MAX_EMBEDDING_TOKENS_PER_MINUTE:
-            raise ValueError(
-                f"임베딩 요청 토큰 수({token_count})가 안전 한도 "
-                f"({MAX_EMBEDDING_TOKENS_PER_MINUTE})를 초과했습니다."
-            )
-
-        while True:
-            now = time.monotonic()
-            while self.usage and now - self.usage[0][0] >= EMBEDDING_RATE_WINDOW_SECONDS:
-                _, expired_tokens = self.usage.popleft()
-                self.total_tokens -= expired_tokens
-
-            if self.total_tokens + token_count <= MAX_EMBEDDING_TOKENS_PER_MINUTE:
-                return
-
-            wait_sec = max(
-                1,
-                math.ceil(
-                    EMBEDDING_RATE_WINDOW_SECONDS - (now - self.usage[0][0])
-                )
-            )
-            print(f"   -> [임베딩 토큰 속도 제한] {wait_sec}초 대기...")
-            time.sleep(wait_sec)
-
-    def record(self, token_count):
-        self.usage.append((time.monotonic(), token_count))
-        self.total_tokens += token_count
-
-
-def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
-    """표준화된 메타데이터 부여, 노이즈 조각 필터링, 엑셀 양식/수식 추출을 수행합니다."""
+def extract_documents_from_file(temp_path, ext, base_meta):
+    """문서 포맷별 텍스트 추출, 중복 제거 및 세팅 주제(setup_topic) 메타데이터를 부여합니다."""
     docs = []
-    seen_hashes = set()  # 문서 내 중복 텍스트(반복 머리말 등) 제거용 해시 세트
+    seen_hashes = set()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
 
     def add_valid_chunk(content, location_str, chunk_type="일반본문"):
         cleaned = clean_and_filter_text(content)
         if len(cleaned) < MIN_CHUNK_CHARS:
-            return  # 50자 미만의 표지/제목 조각은 과감히 버려 경량화
+            return
+        content_hash = hashlib.md5(cleaned.encode('utf-8')).hexdigest()
+        if content_hash in seen_hashes:
+            return
+        seen_hashes.add(content_hash)
 
-        chunks = (
-            split_text_by_token_budget(
-                cleaned, embeddings, MAX_EMBEDDING_TOKENS_PER_MINUTE
-            )
-            if ext == 'xlsx' and embeddings is not None
-            else [cleaned]
-        )
-        for index, chunk in enumerate(chunks, start=1):
-            content_hash = hashlib.md5(chunk.encode('utf-8')).hexdigest()
-            if content_hash in seen_hashes:
+        meta = base_meta.copy()
+        meta["location"] = location_str
+        meta["chunk_type"] = chunk_type
+        meta["setup_topic"] = detect_setup_topic(cleaned)
+        meta["char_length"] = len(cleaned)
+        docs.append(Document(page_content=cleaned, metadata=meta))
+
+    if ext == 'txt':
+        with open(temp_path, 'rb') as f:
+            raw_bytes = f.read()
+        text = ""
+        for enc in ['utf-16', 'utf-8-sig', 'cp949', 'utf-8']:
+            try:
+                text = raw_bytes.decode(enc)
+                break
+            except Exception:
                 continue
-            seen_hashes.add(content_hash)
+        if text:
+            if "*PARAM" in text and "*GROUP" in text:
+                lines = text.splitlines()
+                groups = {}
+                params = []
+                for line in lines:
+                    parts = line.split('\t')
+                    if parts[0] == 'GROUP' and len(parts) >= 3:
+                        groups[parts[1]] = parts[2]
+                    elif parts[0] == 'PARAM' and len(parts) >= 6:
+                        p_guid = parts[1]
+                        p_name = parts[2]
+                        p_type = parts[3]
+                        p_group = groups.get(parts[5], parts[5])
+                        params.append(f"- 매개변수명: {p_name} | 자료형: {p_type} | 그룹: {p_group} | GUID: {p_guid}")
+                if params:
+                    param_summary = (
+                        f"[Revit 사내 표준 공유 매개변수(Shared Parameters) 원본 정의 - 파일: {base_meta['file_name']}]\n"
+                        f"총 등록된 매개변수 수: {len(params)}개\n" + "\n".join(params)
+                    )
+                    for idx, chunk in enumerate(text_splitter.split_text(param_summary), start=1):
+                        add_valid_chunk(chunk, f"공유매개변수 목록 #{idx}", "세팅기준데이터")
+            else:
+                for idx, chunk in enumerate(text_splitter.split_text(text), start=1):
+                    add_valid_chunk(chunk, f"텍스트 섹션 #{idx}", "세팅기준데이터")
 
-            meta = base_meta.copy()
-            meta["location"] = (
-                f"{location_str} (부분 {index}/{len(chunks)})"
-                if len(chunks) > 1
-                else location_str
-            )
-            meta["chunk_type"] = chunk_type
-            meta["char_length"] = len(chunk)
-            docs.append(Document(page_content=chunk, metadata=meta))
-
-    if ext == 'pdf':
+    elif ext == 'pdf':
         reader = PdfReader(temp_path)
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
@@ -176,7 +152,6 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
                     for paragraph in shape.text_frame.paragraphs:
                         if paragraph.text.strip():
                             slide_texts.append(paragraph.text.strip())
-                # PPT 내 표(Table) 텍스트도 누락 없이 추출
                 if shape.has_table:
                     for row in shape.table.rows:
                         row_txt = [cell.text.strip().replace('\n', ' ') for cell in row.cells if cell.text.strip()]
@@ -188,7 +163,6 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
                     add_valid_chunk(chunk, f"슬라이드 {i + 1}장", "보고서슬라이드")
 
     elif ext == 'xlsx':
-        # 1) 계산된 결과값 로드 (data_only=True) 및 2) 작성된 산출 수식 로드 (data_only=False)
         wb_val = openpyxl.load_workbook(temp_path, data_only=True)
         wb_formula = openpyxl.load_workbook(temp_path, data_only=False)
 
@@ -201,7 +175,6 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
             if len(rows_val) < 2:
                 continue
 
-            # 의미 있는 헤더 행 찾기 (첫 5행 중 텍스트가 가장 많은 행을 헤더로 인식)
             header_idx = 0
             max_non_empty = 0
             for idx in range(min(5, len(rows_val))):
@@ -213,18 +186,15 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
             headers = [str(h).strip().replace('\n', ' ') if h is not None else f"열{i+1}" for i, h in enumerate(rows_val[header_idx])]
             valid_headers = [h for h in headers if not h.startswith("열")]
 
-            # [핵심 고도화] 시트 양식 구조 및 수량산출 공식(Formula) 요약 청크 생성
             formula_samples = []
             summary_rows = []
             for r_i in range(header_idx + 1, len(rows_form)):
                 r_f = rows_form[r_i]
                 r_v = rows_val[r_i]
-                # 수식('='로 시작)이 포함된 셀이 있다면 산출 방법 파악을 위해 샘플 수집 (최대 5개)
                 if len(formula_samples) < 5:
                     for h_name, f_cell, v_cell in zip(headers, r_f, r_v):
                         if isinstance(f_cell, str) and f_cell.startswith('='):
                             formula_samples.append(f"[{h_name}] 산출수식: {f_cell} (결과예시: {v_cell})")
-                # '합계', '소계', '총계', '비교'가 들어간 핵심 요약 행 별도 수집
                 row_str_joined = " ".join([str(c) for c in r_v if c is not None])
                 if any(k in row_str_joined for k in ['합계', '소계', '총계', '계', '비교', '차이']) and len(summary_rows) < 10:
                     items = [f"{h}: {str(v).strip()}" for h, v in zip(headers, r_v) if v is not None and str(v).strip() != ""]
@@ -239,7 +209,6 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
             )
             add_valid_chunk(structure_summary, f"{sheet} 시트 (양식/산출식 구조)", "양식및산출기준")
 
-            # 일반 데이터 행은 25행 단위로 묶되, 시트당 최대 15개 청크까지만 생성하여 DB 비대화 방지
             batch_rows_text = []
             start_row_num = header_idx + 2
             sheet_chunk_count = 0
@@ -261,82 +230,41 @@ def extract_documents_from_file(temp_path, ext, base_meta, embeddings=None):
     return docs
 
 
-def embed_with_rate_limit(embeddings, texts, batch_size=100, token_rate_limiter=None):
-    """토큰 사용량을 제한하고 서버가 안내한 대기 시간으로 재시도합니다."""
+def embed_with_rate_limit(embeddings, texts, batch_size=100):
+    """무한 루프 방지 및 API 효율 극대화를 위한 임베딩 함수입니다."""
     all_vectors = []
     total = len(texts)
     max_retries = 3
-    token_rate_limiter = token_rate_limiter or EmbeddingTokenRateLimiter()
-
-    def token_bounded_batches(batch):
-        token_count = count_embedding_tokens(embeddings, batch)
-        if token_count <= MAX_EMBEDDING_TOKENS_PER_MINUTE:
-            yield batch, token_count
-            return
-        if len(batch) == 1:
-            raise ValueError(
-                f"단일 임베딩 조각이 안전 토큰 한도 "
-                f"({MAX_EMBEDDING_TOKENS_PER_MINUTE})를 초과했습니다."
-            )
-
-        midpoint = len(batch) // 2
-        yield from token_bounded_batches(batch[:midpoint])
-        yield from token_bounded_batches(batch[midpoint:])
     
     for i in range(0, total, batch_size):
         batch = texts[i : i + batch_size]
-        for bounded_batch, token_count in token_bounded_batches(batch):
-            token_rate_limiter.wait_for_capacity(token_count)
-            retry_count = 0
-
-            while True:
-                try:
-                    vectors = embeddings.embed_documents(bounded_batch)
-                    all_vectors.extend(vectors)
-                    token_rate_limiter.record(token_count)
-                    print(
-                        f"     ... 임베딩 진행률: {len(all_vectors)} / "
-                        f"{total} 조각 완료"
-                    )
-                    break
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" not in err_msg and "RESOURCE_EXHAUSTED" not in err_msg:
-                        raise
-
+        retry_count = 0
+        
+        while True:
+            try:
+                vectors = embeddings.embed_documents(batch)
+                all_vectors.extend(vectors)
+                print(f"     ... 임베딩 진행률: {min(i + batch_size, total)} / {total} 조각 완료")
+                if i + batch_size < total:
+                    time.sleep(2)
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     retry_count += 1
                     if retry_count > max_retries:
-                        print(
-                            "\n[임베딩 중단] API 할당량/속도 제한이 "
-                            "재시도 후에도 지속됩니다."
-                        )
-                        raise
-
-                    retry_match = re.search(
-                        r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s",
-                        err_msg,
-                        re.IGNORECASE
-                    )
-                    if not retry_match:
-                        retry_match = re.search(
-                            r"retry in\s+(\d+(?:\.\d+)?)\s*(?:s|seconds)",
-                            err_msg,
-                            re.IGNORECASE
-                        )
-                    wait_sec = (
-                        max(1, math.ceil(float(retry_match.group(1))))
-                        if retry_match
-                        else EMBEDDING_RATE_WINDOW_SECONDS
-                    )
-                    print(
-                        f"   -> [API 할당량 대기] {wait_sec}초 대기 후 "
-                        f"재시도... ({retry_count}/{max_retries}회)"
-                    )
+                        print("\n[치명적 오류] 일일 무료 할당량이 고갈되었습니다. 작업을 강제 종료합니다.")
+                        raise e
+                    wait_sec = 45
+                    print(f"   -> [API 할당량 대기] {wait_sec}초 대기 후 재시도... ({retry_count}/{max_retries}회)")
                     time.sleep(wait_sec)
+                else:
+                    raise e
     return all_vectors
 
 
 def get_all_files_recursively(drive_service, folder_id):
+    """폴더 및 하위 폴더의 모든 파일 목록을 재귀적으로 스캔합니다."""
     all_files = []
     folders_to_scan = [folder_id]
     while folders_to_scan:
@@ -354,11 +282,8 @@ def get_all_files_recursively(drive_service, folder_id):
     return all_files
 
 
-def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
-    print("=== [Step 1-B: 표준 분류 체계 및 경량화 기반 Vector DB 동기화 시작] ===\n")
-
-    if force_rebuild and target_file_name:
-        raise ValueError("특정 파일 처리와 전체 Vector DB 재구축은 함께 실행할 수 없습니다.")
+def ingest_manuals_to_chroma(force_rebuild=False):
+    print("=== [Step 1-B: 표준 분류 체계 및 세팅 기준 Vector DB 동기화 시작] ===\n")
 
     load_dotenv()
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -381,8 +306,7 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
     existing_files = {}
     for meta in existing_data.get("metadatas", []):
         if meta and "file_id" in meta:
-            # 표준 메타데이터(doc_category)가 없는 구버전 데이터는 재학습 유도
-            if "doc_category" not in meta:
+            if "doc_category" not in meta or "setup_topic" not in meta:
                 existing_files[meta["file_id"]] = "NEED_UPGRADE"
             else:
                 existing_files[meta["file_id"]] = meta.get("modified_time", "")
@@ -395,27 +319,11 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
 
     manual_files = get_all_files_recursively(drive_service, manual_folder_id)
     bim_files = get_all_files_recursively(drive_service, bim_folder_id)
-    listed_files = manual_files + bim_files
-    if target_file_name:
-        listed_files = [
-            file for file in listed_files
-            if file.get('name') == target_file_name
-        ]
-        if len(listed_files) != 1:
-            raise FileNotFoundError(
-                f"Google Drive에서 이름이 정확히 '{target_file_name}'인 파일을 "
-                f"1개 찾을 것으로 예상했지만 {len(listed_files)}개 찾았습니다."
-            )
-
-    unique_drive_files = {f.get('id'): f for f in listed_files}
+    unique_drive_files = {f.get('id'): f for f in manual_files + bim_files}
     drive_files = list(unique_drive_files.values())
 
     drive_file_ids = set(unique_drive_files.keys())
-    deleted_ids = (
-        set(existing_files.keys()) - drive_file_ids
-        if target_file_name is None
-        else set()
-    )
+    deleted_ids = set(existing_files.keys()) - drive_file_ids
     deleted_count = 0
 
     if deleted_ids:
@@ -428,9 +336,8 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
         model="models/gemini-embedding-001",
         google_api_key=gemini_api_key
     )
-    token_rate_limiter = EmbeddingTokenRateLimiter()
 
-    supported_extensions = {'pdf', 'docx', 'pptx', 'xlsx'}
+    supported_extensions = {'pdf', 'docx', 'pptx', 'xlsx', 'txt'}
     new_count = 0
     updated_count = 0
 
@@ -462,14 +369,12 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
 
         is_update = False
         if file_id in existing_files:
-            if (
-                existing_files[file_id] == drive_mod_time
-                and target_file_name is None
-            ):
+            if existing_files[file_id] == drive_mod_time:
                 print(f" - [유지] [{doc_category}] '{file_name}' (최신 표준 적용됨)")
                 continue
             else:
                 print(f" - [표준화 업그레이드/변경] [{doc_category}] '{file_name}' 재학습 중...")
+                collection.delete(where={"file_id": file_id})
                 is_update = True
         else:
             print(f" - [신규 처리] [{doc_category}] '{file_name}' 추출 중...")
@@ -499,9 +404,7 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
                 "modified_time": drive_mod_time
             }
             
-            docs = extract_documents_from_file(
-                temp_path, ext, base_meta, embeddings=embeddings
-            )
+            docs = extract_documents_from_file(temp_path, ext, base_meta)
 
             if docs:
                 texts = [doc.page_content for doc in docs]
@@ -509,25 +412,9 @@ def ingest_manuals_to_chroma(force_rebuild=False, target_file_name=None):
                 ids = [f"{file_id}_chunk_{i}" for i in range(len(docs))]
 
                 print(f"   -> 경량화 후 유효 조각 수: {len(docs)}개 (임베딩 시작...)")
-                vectors = embed_with_rate_limit(
-                    embeddings,
-                    texts,
-                    batch_size=100,
-                    token_rate_limiter=token_rate_limiter
-                )
+                vectors = embed_with_rate_limit(embeddings, texts, batch_size=100)
                 
-                previous_ids = collection.get(
-                    where={"file_id": file_id}, include=[]
-                )["ids"]
-                collection.upsert(
-                    ids=ids,
-                    embeddings=vectors,
-                    documents=texts,
-                    metadatas=metadatas
-                )
-                stale_ids = set(previous_ids) - set(ids)
-                if stale_ids:
-                    collection.delete(ids=list(stale_ids))
+                collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metadatas)
                 if is_update:
                     updated_count += 1
                 else:
