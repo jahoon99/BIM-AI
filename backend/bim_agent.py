@@ -3,12 +3,13 @@ import re
 import time
 import uuid
 import json
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 import chromadb
 import gspread
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
-# 1. 환경변수 및 로컬 브릿지 경로 설정
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -21,7 +22,11 @@ os.makedirs(BRIDGE_DIR, exist_ok=True)
 LIVE_SCRIPT_PATH = os.path.join(BRIDGE_DIR, "live_setup.py")
 DYN_PLAYER_PATH = os.path.join(BRIDGE_DIR, "BF_AI세팅실행기.dyn")
 
-# 2. 글로벌 인스턴스 초기화
+REVIT_BASE_URL = "http://" + "127.0.0.1:48884/bim-ai-codex"
+REVIT_PING_URL = REVIT_BASE_URL + "/ping"
+REVIT_EXEC_URL = REVIT_BASE_URL + "/execute"
+REVIT_INSPECT_URL = REVIT_BASE_URL + "/inspect"
+
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.8-flash", 
     google_api_key=GOOGLE_API_KEY, 
@@ -42,7 +47,6 @@ gc = gspread.service_account(filename=CRED_PATH)
 sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-# 3. 구글 시트 데이터 인메모리 캐시(In-Memory Cache) 설정
 _SHEET_CACHE = {
     "data": None,
     "last_fetched": 0
@@ -50,16 +54,13 @@ _SHEET_CACHE = {
 CACHE_TTL_SECONDS = 600
 
 def get_cached_sheet_records(force_refresh=False):
-    """구글 시트 API 호출을 줄이기 위해 10분 주기로 메모리에 데이터를 캐싱합니다."""
     current_time = time.time()
     if force_refresh or _SHEET_CACHE["data"] is None or (current_time - _SHEET_CACHE["last_fetched"] > CACHE_TTL_SECONDS):
         _SHEET_CACHE["data"] = worksheet.get_all_records()
         _SHEET_CACHE["last_fetched"] = current_time
     return _SHEET_CACHE["data"]
 
-
 def get_indexed_manual_list():
-    """현재 ChromaDB에 학습되어 있는 전체 매뉴얼/보고서의 파일명 목록을 반환합니다."""
     global collection
     if not collection:
         try:
@@ -73,9 +74,7 @@ def get_indexed_manual_list():
     except Exception:
         return []
 
-
 def get_vector_db_status():
-    """Vector DB 내부의 문서별 분류 현황 및 세팅 주제(setup_topic) 상세 데이터를 반환합니다."""
     global collection
     if not collection:
         try:
@@ -137,9 +136,7 @@ def get_vector_db_status():
     except Exception:
         return [], []
 
-
 def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
-    """다중 문서 비교 시 특정 문서가 결과를 독점하지 않도록 문서별 균등 할당 검색을 수행합니다."""
     global collection
     if not collection:
         try:
@@ -186,8 +183,9 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
                         loc = meta.get("location", "")
                         link = meta.get("drive_link", "")
                         context_list.append(
-                            f"--- [조각 #{chunk_counter} | 문서: {fname} ({loc}) | 분류: {cat} | 세팅주제: {stopic} | 거리: {dist:.3f}] ---\n"
-                            f"내용: {doc}\n원본 링크: {link}"
+                            "--- [조각 #{0} | 문서: {1} ({2}) | 분류: {3} | 세팅주제: {4} | 거리: {5:.3f}] ---\n내용: {6}\n원본 링크: {7}".format(
+                                chunk_counter, fname, loc, cat, stopic, dist, doc, link
+                            )
                         )
                         chunk_counter += 1
             except Exception:
@@ -224,8 +222,9 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
             link = meta.get("drive_link", "")
 
             context_list.append(
-                f"--- [조각 #{chunk_counter} | 문서: {fname} ({loc}) | 분류: {cat} | 세팅주제: {stopic} | 거리: {dist:.3f}] ---\n"
-                f"내용: {doc}\n원본 링크: {link}"
+                "--- [조각 #{0} | 문서: {1} ({2}) | 분류: {3} | 세팅주제: {4} | 거리: {5:.3f}] ---\n내용: {6}\n원본 링크: {7}".format(
+                    chunk_counter, fname, loc, cat, stopic, dist, doc, link
+                )
             )
             chunk_counter += 1
             if len(context_list) >= top_k:
@@ -233,16 +232,8 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
 
     return "\n\n".join(context_list) if context_list else "관련 매뉴얼 내용을 찾을 수 없습니다."
 
-
 def extract_keywords_with_llm(query):
-    """질문에서 핵심 대상 명사와 한/영 유의어를 추출합니다."""
-    extraction_prompt = f"""다음 사용자의 질문에서 BIM 파일 검색에 필요한 '핵심 대상 명사'만 추출하세요.
-'패밀리', '파일', '레빗', '찾아줘', '필요해' 같은 일반 명사나 서술어, 조사는 모두 제거하세요.
-특히 추출된 단어의 한글 발음, 영문 표기, 건설/BIM 실무 동의어가 있다면 반드시 함께 나열하세요.
-결과는 다른 설명 없이 오직 쉼표(,)로 구분된 단어로만 출력하세요.
-
-사용자 질문: {query}"""
-
+    extraction_prompt = "다음 사용자의 질문에서 BIM 파일 검색에 필요한 '핵심 대상 명사'만 추출하세요.\n'패밀리', '파일', '레빗', '찾아줘', '필요해' 같은 일반 명사나 서술어, 조사는 모두 제거하세요.\n특히 추출된 단어의 한글 발음, 영문 표기, 건설/BIM 실무 동의어가 있다면 반드시 함께 나열하세요.\n결과는 다른 설명 없이 오직 쉼표(,)로 구분된 단어로만 출력하세요.\n\n사용자 질문: {0}".format(query)
     try:
         response = llm.invoke(extraction_prompt)
         content = response.content
@@ -256,20 +247,16 @@ def extract_keywords_with_llm(query):
     except Exception:
         return [re.sub(r'[^a-z0-9가-힣]', '', w.lower()) for w in query.split() if len(w) > 1]
 
-
 def search_bim_files(query):
-    """캐싱된 시트 데이터를 바탕으로 빠르게 BIM 파일을 검색합니다."""
     all_records = get_cached_sheet_records()
     if not all_records:
         return "구글 시트에 등록된 BIM 파일이 없습니다."
 
     if len(all_records) <= 100:
-        result_list = [f"[전체 BIM 파일 목록 직접 스캔 모드 (총 {len(all_records)}개 / 메모리 캐시 적용됨)]"]
+        result_list = ["[전체 BIM 파일 목록 직접 스캔 모드 (총 {0}개 / 메모리 캐시 적용됨)]".format(len(all_records))]
         for f in all_records:
-            file_info = (
-                f"- 파일명: {f.get('file_name')} | 분류: {f.get('category')} | 버전: {f.get('software_version')}\n"
-                f"  설명: {f.get('description')}\n"
-                f"  다운로드: {f.get('drive_link')}"
+            file_info = "- 파일명: {0} | 분류: {1} | 버전: {2}\n  설명: {3}\n  다운로드: {4}".format(
+                f.get('file_name'), f.get('category'), f.get('software_version'), f.get('description'), f.get('drive_link')
             )
             result_list.append(file_info)
         return "\n".join(result_list)
@@ -296,68 +283,36 @@ def search_bim_files(query):
             scored_files.append((score, record))
             
     if not scored_files:
-        return f"관련된 BIM 파일을 찾을 수 없습니다. (AI 자동 생성 검색어: {', '.join(clean_keywords)})"
+        return "관련된 BIM 파일을 찾을 수 없습니다. (AI 자동 확장 검색어: {0})".format(', '.join(clean_keywords))
         
     scored_files.sort(key=lambda x: x[0], reverse=True)
-    result_list = [f"[AI 자동 확장 검색어: {', '.join(clean_keywords)} / 메모리 캐시 적용됨]"]
+    result_list = ["[AI 자동 확장 검색어: {0} / 메모리 캐시 적용됨]".format(', '.join(clean_keywords))]
     for score, f in scored_files[:10]:
-        file_info = (
-            f"- 파일명: {f.get('file_name')} | 분류: {f.get('category')} | 버전: {f.get('software_version')} | 점수: {score}점\n"
-            f"  설명: {f.get('description')}\n"
-            f"  다운로드: {f.get('drive_link')}"
+        file_info = "- 파일명: {0} | 분류: {1} | 버전: {2} | 점수: {3}점\n  설명: {4}\n  다운로드: {5}".format(
+            f.get('file_name'), f.get('category'), f.get('software_version'), score, f.get('description'), f.get('drive_link')
         )
         result_list.append(file_info)
     return "\n".join(result_list)
 
-
 def get_ai_response(user_query, chat_history=None, return_context=False, target_manuals=None, target_category=None):
-    """다중 문서 공통점/차이점 비교 분석 및 프로젝트 초기 세팅 가이드 도출에 최적화된 응답 생성 함수입니다."""
     history_text = "이전 대화 없음"
     if chat_history:
         recent_msgs = chat_history[-6:]
-        formatted_msgs = [f"{'사용자' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in recent_msgs]
+        formatted_msgs = ["{0}: {1}".format('사용자' if m['role'] == 'user' else 'AI', m['content']) for m in recent_msgs]
         history_text = "\n".join(formatted_msgs)
 
     search_query = user_query
     if chat_history and len(user_query) < 15:
         last_user_msgs = [m["content"] for m in chat_history if m["role"] == "user"]
         if last_user_msgs:
-            search_query = f"{last_user_msgs[-1]} {user_query}"
+            search_query = "{0} {1}".format(last_user_msgs[-1], user_query)
 
-    manual_context = search_manuals(
-        search_query, 
-        top_k=8, 
-        target_manuals=target_manuals, 
-        target_category=target_category
-    )
+    manual_context = search_manuals(search_query, top_k=8, target_manuals=target_manuals, target_category=target_category)
     file_context = search_bim_files(search_query)
     
-    prompt = f"""당신은 사내 BIM 및 건설 데이터 관리 전문 AI 어시스턴트입니다.
-아래의 [이전 대화 기록]을 참고하고, 제공된 [매뉴얼/보고서/세팅기준 지식]과 [BIM 파일 목록]만을 바탕으로 정확하게 답변하세요.
-
-[핵심 사실 및 제한 규칙]
-1. 두 저장소 모두에서 관련 정보를 전혀 찾을 수 없을 때만 '제공된 문서에서 찾을 수 없습니다.'라고 답변하세요.
-2. 제공된 데이터에 없는 내용을 추측하여 지어내지 마세요. 단, 문서에 명시된 사실들을 조합하여 실무 세팅 순서나 체크리스트로 재구성하는 것은 적극 수행하세요.
-
-[다중 문서 비교 및 프로젝트 초기 세팅 도출 규칙]
-1. **보고서 간 비교 / 가이드북 간 공통점·차이점 분석 요청 시:**
-   - 비교 항목을 기준으로 **마크다운 비교표(| 비교 기준 | 문서 A | 문서 B | 비고/출처 |)**를 작성하세요.
-   - 표 아래에 **[공통점]**과 **[핵심 차이점]**을 명확히 구분하여 요약하세요.
-2. **프로젝트 초기 세팅(매개변수, 뷰/필터 세팅, 템플릿 활용 등) 요청 시:**
-   - [매뉴얼/보고서/세팅기준 지식]과 [BIM 파일 목록]의 사내 표준 파일(템플릿 `.rte`, 공유 매개변수 `.txt`, 시트 도각 `.rfa` 등)을 연계하여 **[실무 프로젝트 초기 세팅 단계별 가이드]**를 제시하세요.
-3. 모든 인용 출처와 파일은 클릭 가능한 `[원본 보기](링크)` 또는 `[다운로드](링크)` 하이퍼링크를 포함하세요.
-
-[이전 대화 기록]
-{history_text}
-
-현재 사용자 질문: {user_query}
-
-[매뉴얼/보고서/세팅기준 지식]
-{manual_context}
-
-[BIM 파일 목록]
-{file_context}
-"""
+    prompt = "당신은 사내 BIM 및 건설 데이터 관리 전문 AI 어시스턴트입니다.\n아래의 [이전 대화 기록]을 참고하고, 제공된 [매뉴얼/보고서/세팅기준 지식]과 [BIM 파일 목록]만을 바탕으로 정확하게 답변하세요.\n\n[핵심 사실 및 제한 규칙]\n1. 두 저장소 모두에서 관련 정보를 전혀 찾을 수 없을 때만 '제공된 문서에서 찾을 수 없습니다.'라고 답변하세요.\n2. 제공된 데이터에 없는 내용을 추측하여 지어내지 마세요.\n\n[이전 대화 기록]\n{0}\n\n현재 사용자 질문: {1}\n\n[매뉴얼/보고서/세팅기준 지식]\n{2}\n\n[BIM 파일 목록]\n{3}".format(
+        history_text, user_query, manual_context, file_context
+    )
     
     response = llm.invoke(prompt)
     content = response.content
@@ -367,49 +322,21 @@ def get_ai_response(user_query, chat_history=None, return_context=False, target_
         return final_answer, manual_context, file_context
     return final_answer
 
-
 def generate_revit_shared_param_file(user_requirement, target_manuals=None):
-    """가이드라인 및 사내 공유 매개변수 지식을 바탕으로 Revit에서 즉시 로드 가능한 공유 매개변수(.txt) 파일을 생성합니다."""
-    context = search_manuals(f"공유 매개변수 파라미터 속성 기준 {user_requirement}", top_k=8, target_manuals=target_manuals)
-    
-    prompt = f"""당신은 Autodesk Revit 공유 매개변수(Shared Parameters) 설계 전문가입니다.
-아래 [참조 기준 문서]와 [사용자 요구사항]을 바탕으로 Revit 공유 매개변수 리스트를 JSON 형식으로 추출하세요.
-만약 참조 기준 문서에 기존 GUID가 명시된 매개변수가 있다면 그 GUID를 그대로 유지하고, 새로 추가하는 매개변수는 "NEW"라고 표기하세요.
-
-Revit 허용 데이터 유형(datatype): TEXT, LENGTH, AREA, VOLUME, INTEGER, NUMBER, YESNO, MATERIAL, URL 중 선택.
-
-반드시 마크다운 코드블록 없이 아래 순수 JSON 배열 형식으로만 응답하세요:
-[
-  {{"group": "1_공통속성", "name": "조달청_분류코드", "datatype": "TEXT", "guid": "NEW", "description": "조달청 표준 BIM 분류체계 코드"}},
-  {{"group": "2_구조속성", "name": "강도기준", "datatype": "TEXT", "guid": "NEW", "description": "콘크리트 및 철골 강도 기준"}}
-]
-
-[사용자 요구사항]
-{user_requirement}
-
-[참조 기준 문서]
-{context}
-"""
+    context = search_manuals("공유 매개변수 파라미터 속성 기준 {0}".format(user_requirement), top_k=8, target_manuals=target_manuals)
+    prompt = "당신은 Autodesk Revit 공유 매개변수 설계 전문가입니다.\n[참조 기준 문서]와 [사용자 요구사항]을 바탕으로 Revit 공유 매개변수 리스트를 순수 JSON 배열 형식으로만 응답하세요.\n[사용자 요구사항]: {0}\n[참조 기준 문서]: {1}".format(user_requirement, context)
     response = llm.invoke(prompt)
     content = response.content
     raw_text = " ".join([part["text"] if isinstance(part, dict) and "text" in part else str(part) for part in content]) if isinstance(content, list) else str(content)
     clean_json = re.sub(r'```json|```', '', raw_text).strip()
-    
     param_list = json.loads(clean_json)
     
     group_names = sorted(list({p.get("group", "기본그룹") for p in param_list}))
     group_map = {g_name: idx + 1 for idx, g_name in enumerate(group_names)}
     
-    lines = [
-        "# This is a Revit shared parameter file.",
-        "# Do not edit manually.",
-        "*META\tVERSION\tMINVERSION",
-        "META\t2\t1",
-        "*GROUP\tID\tNAME"
-    ]
+    lines = ["# This is a Revit shared parameter file.", "# Do not edit manually.", "*META\tVERSION\tMINVERSION", "META\t2\t1", "*GROUP\tID\tNAME"]
     for g_name, g_id in group_map.items():
-        lines.append(f"GROUP\t{g_id}\t{g_name}")
-        
+        lines.append("GROUP\t{0}\t{1}".format(g_id, g_name))
     lines.append("*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE")
     
     for p in param_list:
@@ -418,40 +345,24 @@ Revit 허용 데이터 유형(datatype): TEXT, LENGTH, AREA, VOLUME, INTEGER, NU
             p_guid = str(uuid.uuid4())
         else:
             p_guid = str(raw_guid)
-            
-        p_name = p.get("name", "신규매개변수").replace("\t", "_")
-        p_dtype = p.get("datatype", "TEXT").upper()
-        p_group_id = group_map.get(p.get("group", "기본그룹"), 1)
-        p_desc = p.get("description", "").replace("\t", " ")
-        
-        lines.append(f"PARAM\t{p_guid}\t{p_name}\t{p_dtype}\t\t{p_group_id}\t1\t{p_desc}\t1")
-        
-    final_txt_content = "\r\n".join(lines) + "\r\n"
-    return final_txt_content, param_list
-
+        lines.append("PARAM\t{0}\t{1}\t{2}\t\t{3}\t1\t{4}\t1".format(
+            p_guid, p.get("name", "신규").replace("\t", "_"), p.get("datatype", "TEXT").upper(), group_map.get(p.get("group", "기본"), 1), p.get("description", "").replace("\t", " ")
+        ))
+    return "\r\n".join(lines) + "\r\n", param_list
 
 def generate_dynamo_player_file():
-    """현재 PC의 브릿지 폴더 경로(LIVE_SCRIPT_PATH)가 자동 연결된 Dynamo 플레이어 파일(.dyn)을 생성하여 저장 및 반환합니다."""
     runner_code = (
-        "import os\n"
-        "import traceback\n"
-        "import clr\n\n"
-        "clr.AddReference('RevitAPI')\n"
-        "clr.AddReference('RevitAPIUI')\n"
-        "clr.AddReference('RevitServices')\n"
-        "import Autodesk\n"
-        "from Autodesk.Revit.DB import *\n"
-        "from Autodesk.Revit.UI import *\n"
-        "from RevitServices.Persistence import DocumentManager\n"
-        "from RevitServices.Transactions import TransactionManager\n\n"
+        "import os\nimport traceback\nimport clr\n"
+        "clr.AddReference('RevitAPI')\nclr.AddReference('RevitAPIUI')\nclr.AddReference('RevitServices')\n"
+        "import Autodesk\nfrom Autodesk.Revit.DB import *\nfrom Autodesk.Revit.UI import *\n"
+        "from RevitServices.Persistence import DocumentManager\nfrom RevitServices.Transactions import TransactionManager\n"
         "doc = DocumentManager.Instance.CurrentDBDocument\n"
         "uiapp = DocumentManager.Instance.CurrentUIApplication\n"
-        "uidoc = uiapp.ActiveUIDocument\n\n"
-        "# AI 코드 내부의 Transaction 충돌을 방지하기 위해 Dynamo 기본 트랜잭션 강제 종료\n"
-        "TransactionManager.Instance.ForceCloseTransaction()\n\n"
-        "script_path = IN[0]\n\n"
+        "uidoc = uiapp.ActiveUIDocument\n"
+        "TransactionManager.Instance.ForceCloseTransaction()\n"
+        "script_path = IN[0]\n"
         "if not script_path or not os.path.exists(script_path):\n"
-        "    OUT = f'[대기 중] 실행할 스크립트 파일이 없습니다: {script_path}'\n"
+        "    OUT = '[대기 중] 실행할 스크립트 파일이 없습니다: {}'.format(script_path)\n"
         "else:\n"
         "    try:\n"
         "        with open(script_path, 'r', encoding='utf-8-sig') as f:\n"
@@ -462,255 +373,184 @@ def generate_dynamo_player_file():
         "        exec_scope['uidoc'] = uidoc\n"
         "        exec_scope['__revit__'] = uiapp\n"
         "        exec(ai_code, exec_scope)\n"
-        "        OUT = f'[AI 자동 세팅 성공] 적용 파일: {os.path.basename(script_path)}'\n"
+        "        res_msg = exec_scope.get('RESULT_MSG', '세팅 완료')\n"
+        "        OUT = '[AI 자동 세팅 성공] {}'.format(res_msg)\n"
         "    except Exception as e:\n"
-        "        OUT = f'[실행 오류] {str(e)}\\n{traceback.format_exc()}'"
+        "        OUT = '[실행 오류] {}\n{}'.format(str(e), traceback.format_exc())"
     )
-
     dyn_dict = {
         "Uuid": "8c5d4a21-9b3e-4f1a-8e2c-1d3f5a7b9c0d",
         "IsCustomNode": False,
-        "Description": "AI가 생성한 Revit 자동 세팅 스크립트(live_setup.py)를 실시간으로 읽어 실행하는 Codex 브릿지 실행기입니다.",
+        "Description": "AI 브릿지 실행기",
         "Name": "BF_AI세팅실행기",
         "ElementResolver": {"ResolutionMap": {}},
-        "Inputs": [
-            {
-                "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
-                "Name": "AI 스크립트 경로 (자동연결)",
-                "Type": "string",
-                "Type2": "string",
-                "Value": LIVE_SCRIPT_PATH,
-                "Description": "AI 웹 서버가 실시간으로 세팅 코드를 전송하는 브릿지 파일 경로입니다.",
-                "SelectedIndex": 0
-            }
-        ],
-        "Outputs": [
-            {
-                "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b",
-                "Name": "실행 결과 로그",
-                "Type": "var",
-                "InitialValue": "",
-                "Description": "AI 스크립트 실행 성공 여부 및 에러 로그를 표시합니다."
-            }
-        ],
+        "Inputs": [{"Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b", "Name": "AI 경로", "Type": "string", "Value": LIVE_SCRIPT_PATH}],
+        "Outputs": [{"Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b", "Name": "로그", "Type": "var"}],
         "Nodes": [
-            {
-                "ConcreteType": "CoreNodeModels.Input.Filename, CoreNodeModels",
-                "HintPath": LIVE_SCRIPT_PATH,
-                "InputValue": LIVE_SCRIPT_PATH,
-                "NodeType": "ExtensionNode",
-                "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
-                "Inputs": [],
-                "Outputs": [
-                    {
-                        "Id": "11111111222233334444555566667777",
-                        "Name": "",
-                        "Description": "File Path",
-                        "UsingDefaultValue": False,
-                        "Level": 2,
-                        "UseLevels": False,
-                        "KeepListStructure": False
-                    }
-                ],
-                "Replication": "Disabled",
-                "Description": "실행할 AI 파이썬 스크립트(.py) 경로를 지정합니다."
-            },
-            {
-                "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
-                "NodeType": "PythonScriptNode",
-                "Code": runner_code,
-                "Engine": "CPython3",
-                "VariableInputPorts": True,
-                "Id": "99999999888877776666555544443333",
-                "Inputs": [
-                    {
-                        "Id": "aaaaaaaabbbbccccddddeeeeffffffff",
-                        "Name": "IN[0]",
-                        "Description": "Script File Path",
-                        "UsingDefaultValue": False,
-                        "Level": 2,
-                        "UseLevels": False,
-                        "KeepListStructure": False
-                    }
-                ],
-                "Outputs": [
-                    {
-                        "Id": "fedcba9876543210fedcba9876543210",
-                        "Name": "OUT",
-                        "Description": "Execution Result",
-                        "UsingDefaultValue": False,
-                        "Level": 2,
-                        "UseLevels": False,
-                        "KeepListStructure": False
-                    }
-                ],
-                "Replication": "Disabled",
-                "Description": "AI가 생성한 파이썬 코드를 현재 열린 Revit 모델에 직접 실행합니다."
-            },
-            {
-                "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
-                "NodeType": "ExtensionNode",
-                "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b",
-                "Inputs": [
-                    {
-                        "Id": "0123456789abcdef0123456789abcdef",
-                        "Name": "",
-                        "Description": "Node to evaluate.",
-                        "UsingDefaultValue": False,
-                        "Level": 2,
-                        "UseLevels": False,
-                        "KeepListStructure": False
-                    }
-                ],
-                "Outputs": [
-                    {
-                        "Id": "abcdef0123456789abcdef0123456789",
-                        "Name": "",
-                        "Description": "Watch contents.",
-                        "UsingDefaultValue": False,
-                        "Level": 2,
-                        "UseLevels": False,
-                        "KeepListStructure": False
-                    }
-                ],
-                "Replication": "Disabled",
-                "Description": "실행 결과 로그 출력"
-            }
+            {"ConcreteType": "CoreNodeModels.Input.Filename, CoreNodeModels", "HintPath": LIVE_SCRIPT_PATH, "InputValue": LIVE_SCRIPT_PATH, "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b", "Outputs": [{"Id": "11111111222233334444555566667777"}]},
+            {"ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels", "Code": runner_code, "Engine": "CPython3", "Id": "99999999888877776666555544443333", "Inputs": [{"Id": "aaaaaaaabbbbccccddddeeeeffffffff", "Name": "IN[0]"}]},
+            {"ConcreteType": "CoreNodeModels.Watch, CoreNodeModels", "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b", "Inputs": [{"Id": "0123456789abcdef0123456789abcdef"}]}
         ],
         "Connectors": [
-            {
-                "Start": "11111111222233334444555566667777",
-                "End": "aaaaaaaabbbbccccddddeeeeffffffff",
-                "Id": "c1111111222233334444555566667777",
-                "IsHidden": "False"
-            },
-            {
-                "Start": "fedcba9876543210fedcba9876543210",
-                "End": "0123456789abcdef0123456789abcdef",
-                "Id": "c2222222333344445555666677778888",
-                "IsHidden": "False"
-            }
+            {"Start": "11111111222233334444555566667777", "End": "aaaaaaaabbbbccccddddeeeeffffffff", "Id": "c1"},
+            {"Start": "fedcba9876543210fedcba9876543210", "End": "0123456789abcdef0123456789abcdef", "Id": "c2"}
         ],
-        "Dependencies": [],
-        "NodeLibraryDependencies": [],
-        "Thumbnail": "",
-        "GraphDocumentationURL": None,
-        "ExtensionWorkspaceData": [],
-        "Author": "BIM AI Assistant",
-        "Linting": {
-            "activeLinter": "None",
-            "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
-            "warningCount": 0,
-            "errorCount": 0
-        },
-        "Bindings": [],
-        "View": {
-            "Dynamo": {
-                "ScaleFactor": 1.0,
-                "HasRunWithoutCrash": True,
-                "IsVisibleInDynamoLibrary": True,
-                "Version": "2.19.3.6394",
-                "RunType": "Manual",
-                "RunPeriod": "1000"
-            },
-            "Camera": {
-                "Name": "_Background Preview",
-                "EyeX": -17.0,
-                "EyeY": 24.0,
-                "EyeZ": 50.0,
-                "LookX": 12.0,
-                "LookY": -13.0,
-                "LookZ": -58.0,
-                "UpX": 0.0,
-                "UpY": 1.0,
-                "UpZ": 0.0
-            },
-            "ConnectorPins": [],
-            "NodeViews": [
-                {
-                    "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
-                    "Name": "AI 스크립트 경로 (자동연결)",
-                    "IsSetAsInput": True,
-                    "IsSetAsOutput": False,
-                    "Excluded": False,
-                    "ShowGeometry": True,
-                    "X": 100.0,
-                    "Y": 200.0
-                },
-                {
-                    "Id": "99999999888877776666555544443333",
-                    "Name": "AI Codex Runner (CPython3)",
-                    "IsSetAsInput": False,
-                    "IsSetAsOutput": False,
-                    "Excluded": False,
-                    "ShowGeometry": True,
-                    "X": 450.0,
-                    "Y": 200.0
-                },
-                {
-                    "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b",
-                    "Name": "실행 결과 로그",
-                    "IsSetAsInput": False,
-                    "IsSetAsOutput": True,
-                    "Excluded": False,
-                    "ShowGeometry": True,
-                    "X": 780.0,
-                    "Y": 200.0
-                }
-            ],
-            "Annotations": [],
-            "X": 0.0,
-            "Y": 0.0,
-            "Zoom": 1.0
-        }
+        "View": {"Dynamo": {"Version": "2.19.3.6394"}}
     }
-
-    dyn_json_str = json.dumps(dyn_dict, indent=2, ensure_ascii=False)
+    dyn_str = json.dumps(dyn_dict, indent=2, ensure_ascii=False)
     with open(DYN_PLAYER_PATH, "w", encoding="utf-8") as f:
-        f.write(dyn_json_str)
+        f.write(dyn_str)
+    return dyn_str, DYN_PLAYER_PATH, LIVE_SCRIPT_PATH
 
-    return dyn_json_str, DYN_PLAYER_PATH, LIVE_SCRIPT_PATH
-
-
-def generate_revit_setup_script(user_requirement, target_manuals=None):
-    """스펙북(재료) 및 프로젝트 초기 세팅(레벨, 그리드, 프로젝트 정보)을 기본 템플릿에 자동 적용하는 스크립트를 생성하고 로컬 브릿지에 즉시 배포합니다."""
-    context = search_manuals(f"템플릿 초기 세팅 레벨 그리드 재료 스펙 뷰 탐색기 {user_requirement}", top_k=8, target_manuals=target_manuals)
-    file_context = search_bim_files("템플릿 공유 매개변수 재료")
+def install_pyrevit_extension():
+    startup_py = (
+        "# -*- coding: utf-8 -*-\n"
+        "from pyrevit import routes, HOST_APP\n"
+        "import json, traceback, clr\n"
+        "clr.AddReference('RevitAPI')\nclr.AddReference('RevitAPIUI')\n"
+        "from Autodesk.Revit.DB import *\nfrom Autodesk.Revit.UI import *\n"
+        "api = routes.API('bim-ai-codex')\n\n"
+        "@api.route('/ping', methods=['GET'])\n"
+        "def ping():\n"
+        "    return routes.make_response(data={'status': 'online', 'revit_version': str(HOST_APP.version)})\n"
+        "@api.route('/execute', methods=['POST'])\n"
+        "def execute_ai_code(request, uiapp, doc, uidoc):\n"
+        "    try:\n"
+        "        payload = request.data if isinstance(request.data, dict) else json.loads(str(request.data))\n"
+        "        ai_code = payload.get('code', '')\n"
+        "        exec_scope = globals().copy()\n"
+        "        exec_scope['doc'] = doc\n"
+        "        exec_scope['uiapp'] = uiapp\n"
+        "        exec_scope['uidoc'] = uidoc\n"
+        "        exec_scope['RESULT_MSG'] = '세팅 완료'\n"
+        "        exec(ai_code, exec_scope)\n"
+        "        return routes.make_response(data={'status': 'success', 'output': str(exec_scope.get('RESULT_MSG', '성공'))})\n"
+        "    except Exception as e:\n"
+        "        return routes.make_response(data={'status': 'error', 'error_msg': str(e), 'traceback': traceback.format_exc()})\n"
+        "@api.route('/inspect', methods=['GET'])\n"
+        "def inspect_active_model(doc):\n"
+        "    try:\n"
+        "        if doc is None:\n"
+        "            return routes.make_response(data={'status': 'error', 'error_msg': '문서 없음'})\n"
+        "        p_info = doc.ProjectInformation\n"
+        "        levels = FilteredElementCollector(doc).OfClass(Level).ToElements()\n"
+        "        level_list = [{'name': str(l.Name), 'elevation_mm': round(l.Elevation * 304.8, 1)} for l in levels]\n"
+        "        grids = FilteredElementCollector(doc).OfClass(Grid).ToElements()\n"
+        "        grid_names = sorted([str(g.Name) for g in grids])\n"
+        "        snapshot = {'project_name': str(p_info.Name) if p_info else '', 'levels': level_list, 'grids': grid_names}\n"
+        "        return routes.make_response(data={'status': 'success', 'snapshot': snapshot})\n"
+        "    except Exception as e:\n"
+        "        return routes.make_response(data={'status': 'error', 'traceback': traceback.format_exc()})\n"
+    )
+    local_ext = os.path.join(BRIDGE_DIR, "BIM_AI_Codex.extension")
+    os.makedirs(local_ext, exist_ok=True)
+    with open(os.path.join(local_ext, "startup.py"), "w", encoding="utf-8") as f:
+        f.write(startup_py)
     
-    prompt = f"""당신은 Autodesk Revit API (Revit 2024~2026 CPython3 호환) 개발 전문가입니다.
-작업자가 열린 Revit 문서(`doc`)에서 실행하면 아래 [사용자 세팅 요구사항]과 [참조 기준 문서(스펙북/가이드라인)]의 값을 반영하여 모델을 자동으로 세팅해주는 파이썬 스크립트를 작성하세요.
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        py_ext = os.path.join(appdata, "pyRevit", "Extensions", "BIM_AI_Codex.extension")
+        try:
+            os.makedirs(py_ext, exist_ok=True)
+            with open(os.path.join(py_ext, "startup.py"), "w", encoding="utf-8") as f:
+                f.write(startup_py)
+        except Exception:
+            pass
+    return [local_ext], startup_py
 
-[중요 코드 작성 규칙]
-1. 실행 환경에는 이미 `doc`, `uiapp`, `uidoc`, `Autodesk`, `Transaction`, `Level`, `Grid`, `Material`, `Color`, `XYZ`, `Line`, `FilteredElementCollector`가 로드되어 있으나, 안전을 위해 필요한 클래스 임포트 구문을 포함하세요.
-2. 모든 모델 변경 작업은 반드시 `t = Transaction(doc, "AI Codex Auto Setup")` → `t.Start()` → 작업 수행 → `t.Commit()` 블록 내부에서 수행하세요.
-3. 단위 변환: Revit 내부 길이는 피트(Feet) 단위이므로, 밀리미터(mm) 값을 넣을 때는 반드시 `mm_val / 304.8` 변환 공식을 적용하세요.
-4. 동일한 이름의 레벨, 그리드, 재료가 이미 문서에 존재하는지 먼저 확인하여 중복 이름 에러(`ArgumentException`)가 발생하지 않도록 예외 처리(`try...except`)를 적용하세요.
+def check_revit_connection():
+    try:
+        req = urllib.request.Request(REVIT_PING_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return True, "연결됨 (Revit {0})".format(data.get('revit_version', ''))
+    except Exception:
+        return False, "미연결"
 
-[출력 형식]
-1. 상단에 **[생성된 스크립트의 자동 세팅 내역 요약표]**를 마크다운 표로 설명하세요.
-2. 그 아래에 ```python 코드블록으로 실행 가능한 전체 파이썬 코드를 작성하세요.
+def send_code_to_revit_http(py_code):
+    req = urllib.request.Request(REVIT_EXEC_URL, data=json.dumps({"code": py_code}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30.0) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-[사용자 세팅 요구사항]
-{user_requirement}
+def inspect_active_revit_model():
+    req = urllib.request.Request(REVIT_INSPECT_URL, method="GET")
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-[참조 기준 문서 (스펙북/가이드라인)]
-{context}
-
-[사내 표준 BIM 파일 목록]
-{file_context}
-"""
+def run_live_model_qa(qa_focus, target_manuals=None):
+    is_online, msg = check_revit_connection()
+    if not is_online:
+        return False, None, "Revit 연결 안 됨: {0}".format(msg), ""
+    try:
+        res = inspect_active_revit_model()
+    except Exception as e:
+        return False, None, "스캔 오류: {0}".format(e), ""
+    if res.get("status") != "success":
+        return False, None, "실패: {0}".format(res.get("error_msg")), ""
+    
+    snapshot = res.get("snapshot", {})
+    context = search_manuals("세팅 기준 매개변수 {0}".format(qa_focus), top_k=5, target_manuals=target_manuals)
+    prompt = "현재 Revit 모델 상태와 기준 문서를 대조하여 검수 보고서와 자동 보정 파이썬 코드를 작성하세요.\n[모델 상태]: {0}\n[기준 문서]: {1}".format(json.dumps(snapshot, ensure_ascii=False), context)
+    
     response = llm.invoke(prompt)
     content = response.content
-    full_response = "\n".join([part["text"] if isinstance(part, dict) and "text" in part else str(part) for part in content]) if isinstance(content, list) else str(content)
+    report = "\n".join([part["text"] if isinstance(part, dict) and "text" in part else str(part) for part in content]) if isinstance(content, list) else str(content)
     
-    code_match = re.search(r'```python\s*(.*?)\s*```', full_response, re.DOTALL)
-    extracted_py_code = code_match.group(1) if code_match else full_response
+    match = re.search(r'```python\s*(.*?)\s*```', report, re.DOTALL)
+    fix_code = match.group(1) if match else ""
+    if fix_code:
+        with open(LIVE_SCRIPT_PATH, "w", encoding="utf-8-sig") as f:
+            f.write(fix_code)
+    return True, snapshot, report, fix_code
+
+def generate_revit_setup_script(user_requirement, target_manuals=None):
+    context = search_manuals("템플릿 초기 세팅 레벨 그리드 {0}".format(user_requirement), top_k=5, target_manuals=target_manuals)
+    prompt = "Revit API 파이썬 스크립트를 작성하세요. f-string 절대 금지, .format() 사용, Transaction 필수.\n[요구사항]: {0}\n[참조문서]: {1}".format(user_requirement, context)
+    response = llm.invoke(prompt)
+    content = response.content
+    full_text = "\n".join([part["text"] if isinstance(part, dict) and "text" in part else str(part) for part in content]) if isinstance(content, list) else str(content)
+    match = re.search(r'```python\s*(.*?)\s*```', full_text, re.DOTALL)
+    py_code = match.group(1) if match else full_text
     
-    # [Codex 브릿지 연동] 생성된 파이썬 코드를 로컬 브릿지 경로(bridge/live_setup.py)에 즉시 자동 저장
     with open(LIVE_SCRIPT_PATH, "w", encoding="utf-8-sig") as f:
-        f.write(extracted_py_code)
-    
-    # Dynamo 플레이어 파일(.dyn)도 최신 경로로 함께 갱신 보장
+        f.write(py_code)
     generate_dynamo_player_file()
+    return full_text, py_code, LIVE_SCRIPT_PATH
+
+def fix_revit_code_with_llm(req, code, tb):
+    prompt = "Revit 에러를 수정하세요. f-string 금지, .format() 사용.\n[요구사항]: {0}\n[코드]: {1}\n[에러]: {2}".format(req, code, tb)
+    resp = llm.invoke(prompt)
+    content = resp.content
+    raw = "\n".join([part["text"] if isinstance(part, dict) and "text" in part else str(part) for part in content]) if isinstance(content, list) else str(content)
+    match = re.search(r'```python\s*(.*?)\s*```', raw, re.DOTALL)
+    return match.group(1) if match else raw
+
+def execute_in_revit_with_self_healing(user_requirement, target_manuals=None, max_attempts=3, custom_code=None):
+    logs = []
+    if custom_code:
+        full_desc = "QA 자동 보정"
+        code = custom_code
+    else:
+        full_desc, code, _ = generate_revit_setup_script(user_requirement, target_manuals=target_manuals)
     
-    return full_response, extracted_py_code, LIVE_SCRIPT_PATH
+    online, msg = check_revit_connection()
+    if not online:
+        return False, ["[연결 확인] Revit 미연결 ({0})".format(msg)], full_desc, code
+
+    for attempt in range(1, max_attempts + 1):
+        logs.append("[시도 {0}] 전송 중...".format(attempt))
+        try:
+            res = send_code_to_revit_http(code)
+            if res.get("status") == "success":
+                logs.append(" [성공] 완료: {0}".format(res.get("output")))
+                return True, logs, full_desc, code
+            else:
+                tb = res.get("traceback", res.get("error_msg", ""))
+                logs.append(" [에러] {0}".format(tb.strip().splitlines()[-1] if tb else "알 수 없음"))
+                if attempt < max_attempts:
+                    logs.append(" [디버깅] 자동 수정 중...")
+                    code = fix_revit_code_with_llm(user_requirement, code, tb)
+        except Exception as e:
+            logs.append(" [통신 오류] {0}".format(e))
+            break
+    return False, logs, full_desc, code

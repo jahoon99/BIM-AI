@@ -2,6 +2,7 @@ import streamlit as st
 import sys
 import os
 import io
+import json
 from contextlib import redirect_stdout
 from dotenv import load_dotenv
 
@@ -16,7 +17,11 @@ from backend.bim_agent import (
     get_vector_db_status,
     generate_revit_shared_param_file,
     generate_revit_setup_script,
-    generate_dynamo_player_file
+    generate_dynamo_player_file,
+    install_pyrevit_extension,
+    check_revit_connection,
+    execute_in_revit_with_self_healing,
+    run_live_model_qa
 )
 from data_pipeline.sync_bim_metadata import sync_drive_to_sheets
 from data_pipeline.ingest_manuals import ingest_manuals_to_chroma
@@ -77,11 +82,11 @@ with st.sidebar:
         st.caption("데이터 동기화 기능은 관리자 암호 입력 후 활성화됩니다.")
 
 st.title("BIM 데이터 어시스턴트")
-st.caption("사내 표준 양식, 검토보고서 비교, 레빗 초기 세팅 파일 생성 및 Codex 브릿지 제어를 지원합니다.")
+st.caption("사내 표준 양식, 검토보고서 비교, 레빗 무개입 Codex 제어 및 실시간 양방향 모델 검수(Live QA)를 지원합니다.")
 
 tab_chat, tab_generator, tab_catalog, tab_inspector = st.tabs([
     "AI 검색 및 문서 비교 챗봇", 
-    "AI 레빗 세팅 생성기 및 Codex 브릿지 (.dyn / .txt / .py)",
+    "AI 레빗 무개입 Codex 제어 및 양방향 검수(QA)",
     "전체 BIM 파일 카탈로그", 
     "Vector DB 데이터 구조 및 검증"
 ])
@@ -163,26 +168,46 @@ with tab_chat:
                     
         st.session_state.messages.append({"role": "assistant", "content": response})
 
-# --- [탭 2: AI 레빗 세팅 생성기 및 Codex 브릿지 (.dyn / .txt / .py)] ---
+# --- [탭 2: AI 레빗 무개입 Codex 제어 및 양방향 검수(QA)] ---
 with tab_generator:
-    st.subheader("표준 가이드라인 및 스펙북 기반 Revit 세팅 생성기 (Codex 브릿지 탑재)")
+    st.subheader("표준 가이드라인 및 스펙북 기반 Revit 무개입 Codex 제어 및 양방향 검수기")
     
-    # 상단: Dynamo 플레이어(.dyn) 브릿지 설정 패널
     dyn_json_str, dyn_saved_path, live_py_path = generate_dynamo_player_file()
+    is_revit_online, revit_status_msg = check_revit_connection()
+    
     with st.container(border=True):
-        st.markdown("#### [사전 준비] Revit 연동용 Dynamo 플레이어 실행기 (`BF_AI세팅실행기.dyn`)")
-        st.caption(f"아래 실행기는 현재 PC의 브릿지 경로(`{live_py_path}`)와 자동 연결되어 있습니다. Revit의 Dynamo 플레이어에 아래 폴더(`{os.path.dirname(dyn_saved_path)}`)를 등록해 두면 파일 다운로드 없이 즉시 실행됩니다.")
-        st.download_button(
-            label="Dynamo 플레이어 실행기 다운로드 (BF_AI세팅실행기.dyn)",
-            data=dyn_json_str.encode("utf-8"),
-            file_name="BF_AI세팅실행기.dyn",
-            mime="application/json"
-        )
+        col_st1, col_st2, col_st3 = st.columns([2, 2, 2])
+        with col_st1:
+            st.markdown("#### 1. 실시간 Revit 연결 상태")
+            if is_revit_online:
+                st.success(f"무개입 Codex 활성: {revit_status_msg}")
+            else:
+                st.warning(f"상태: {revit_status_msg}")
+            if st.button("연결 상태 새로고침", use_container_width=True):
+                st.rerun()
+                
+        with col_st2:
+            st.markdown("#### 2. 무개입 수신기 원클릭 설치 (pyRevit)")
+            st.caption("클릭 시 `%APPDATA%\\pyRevit\\Extensions`에 양방향 수신기(/execute 및 /inspect)를 자동 설치합니다. 설치 후 Revit에서 pyRevit Reload를 실행하세요.")
+            if st.button("pyRevit 양방향 수신기 자동 설치/업데이트", use_container_width=True):
+                paths, _ = install_pyrevit_extension()
+                st.success("수신기 설치 완료: " + ", ".join(paths))
+                
+        with col_st3:
+            st.markdown("#### 3. Dynamo 플레이어 실행기 (대체용)")
+            st.caption(f"pyRevit 없이 사용할 경우 Dynamo 플레이어에 `{os.path.dirname(dyn_saved_path)}` 폴더를 등록해 사용하세요.")
+            st.download_button(
+                label="Dynamo 실행기 다운로드 (.dyn)",
+                data=dyn_json_str.encode("utf-8"),
+                file_name="BF_AI세팅실행기.dyn",
+                mime="application/json",
+                use_container_width=True
+            )
 
     st.divider()
 
     gen_manuals = st.multiselect(
-        "참조할 기준 문서 선택 (예: 조달청 가이드라인, 스펙북, BF_SM_공유 매개변수.txt 등)",
+        "참조 및 대조할 기준 문서 선택 (예: 조달청 가이드라인, 스펙북, BF_SM_공유 매개변수.txt, 검토리스트 등)",
         options=manual_list,
         placeholder="비워두면 관련 기준 문서를 AI가 자동으로 찾아 참조합니다",
         key="gen_multiselect"
@@ -192,12 +217,12 @@ with tab_generator:
     
     # 좌측: 공유 매개변수(.txt) 파일 직접 생성기
     with col_gen1:
-        st.markdown("### 1. Revit 공유 매개변수 파일(`.txt`) 생성")
-        st.caption("사내 `BF_SM_공유 매개변수.txt` 포맷과 조달청/발주처 가이드라인을 결합하여 레빗에 바로 로드 가능한 신규 `.txt` 파일을 생성합니다.")
+        st.markdown("### A. Revit 공유 매개변수 파일(`.txt`) 생성")
+        st.caption("사내 공유 매개변수 포맷과 조달청/발주처 가이드라인을 결합하여 레빗에 바로 로드 가능한 신규 `.txt` 파일을 생성합니다.")
         param_req = st.text_area(
             "추가하거나 반영할 매개변수 요구사항 입력",
             value="기존 사내 공유 매개변수에 더해, 조달청 BIM 납품 기준에 필요한 구조/토목/건축 필수 속성(분류코드, 시공구역, 콘크리트강도, 물량산출여부 등)을 추가해서 공유 매개변수 파일을 만들어줘.",
-            height=130
+            height=140
         )
         if st.button("공유 매개변수 (.txt) 파일 생성", use_container_width=True):
             with st.spinner("가이드라인 분석 및 Revit 표준 포맷(.txt) 조립 중..."):
@@ -215,32 +240,99 @@ with tab_generator:
                 except Exception as e:
                     st.error(f"파일 생성 중 오류 발생: {e}")
 
-    # 우측: 템플릿 초기 세팅 및 재료 자동 생성 스크립트(.py) 생성 및 브릿지 전송기
+    # 우측: 완전 무개입 Codex 실행기 (자동 세팅 + 에러 발생 시 AI 자율 디버깅 루프)
     with col_gen2:
-        st.markdown("### 2. 템플릿(레벨/그리드/뷰) 및 재료 자동 세팅 (Codex 브릿지 전송)")
-        st.caption("버튼을 누르면 AI가 생성한 세팅 코드가 로컬 브릿지(`live_setup.py`)에 즉시 덮어써집니다. Revit Dynamo 플레이어에서 재생만 누르면 즉시 모델에 반영됩니다.")
+        st.markdown("### B. 템플릿(레벨/그리드/뷰) 및 재료 완전 무개입 Codex 실행")
+        st.caption("버튼을 누르면 열려 있는 Revit에 AI가 직접 접속해 모델을 세팅하며, 에러 발생 시 최대 3회까지 스스로 코드를 고쳐 재실행합니다.")
         script_req = st.text_area(
             "프로젝트 초기 세팅 및 스펙북 재료 요구사항 입력",
-            value="프로젝트명 '신규 사옥 신축공사', 층고 4200mm 기준 지상 1층~지상 5층 레벨 생성, X축 8000mm 간격 그리드 5개(1~5열) 및 Y축 8000mm 간격 그리드 4개(A~D열) 생성, 스펙북 기준 외부 화강석(RGB 190,190,185) 및 로이복층유리(RGB 150,200,220, 투명도 70) 재료를 자동 생성하는 Revit Python 스크립트를 만들어줘.",
-            height=130
+            value="프로젝트명 '신규 사옥 신축공사', 층고 4200mm 기준 지상 1층~지상 5층 레벨 생성, X축 8000mm 간격 그리드 5개(1~5열) 및 Y축 8000mm 간격 그리드 4개(A~D열) 생성, 스펙북 기준 외부 화강석(RGB 190,190,185) 및 로이복층유리(RGB 150,200,220, 투명도 70) 재료를 자동 생성해줘.",
+            height=140
         )
-        if st.button("AI 세팅 코드 생성 및 레빗 브릿지 즉시 전송", use_container_width=True):
-            with st.spinner("Revit API 세팅 코드 생성 및 로컬 브릿지 배포 중..."):
+        if st.button("완전 무개입 Codex 실행 (Revit 실시간 직접 제어)", use_container_width=True):
+            with st.spinner("AI 코드 생성 및 Revit 실시간 주입/자율 디버깅 수행 중..."):
                 try:
-                    full_desc, py_code, bridge_path = generate_revit_setup_script(script_req, target_manuals=gen_manuals)
-                    st.success(f"브릿지 전송 완료! (자동 저장 위치: {bridge_path})")
-                    st.info("이제 열려 있는 Revit의 Dynamo 플레이어에서 [BF_AI세팅실행기]의 재생(Run) 버튼을 클릭하면 즉시 세팅이 완료됩니다.")
+                    success, logs, full_desc, final_code = execute_in_revit_with_self_healing(
+                        script_req, 
+                        target_manuals=gen_manuals, 
+                        max_attempts=3
+                    )
+                    if success:
+                        st.success("Revit 무개입 자동 세팅이 완료되었습니다! Revit 화면을 확인하세요.")
+                    else:
+                        st.warning("실시간 직접 제어 대신 로컬 브릿지(live_setup.py)에 코드가 저장되었습니다. 아래 로그를 확인하세요.")
+                        
+                    with st.expander("Codex 실시간 실행 및 자율 디버깅 로그", expanded=True):
+                        st.code("\n".join(logs), language="text")
+                        
                     st.download_button(
-                        label="Revit 자동 세팅 스크립트 별도 다운로드 (Revit_Auto_Setup.py)",
-                        data=py_code.encode("utf-8-sig"),
+                        label="최종 검증된 Revit 세팅 스크립트 다운로드 (Revit_Auto_Setup.py)",
+                        data=final_code.encode("utf-8-sig"),
                         file_name="Revit_Auto_Setup.py",
                         mime="text/x-python",
                         use_container_width=True
                     )
-                    with st.expander("세팅 내역 설명 및 파이썬 코드 확인", expanded=True):
+                    with st.expander("세팅 내역 설명 및 최종 파이썬 코드 확인"):
                         st.markdown(full_desc)
+                        st.code(final_code, language="python")
                 except Exception as e:
-                    st.error(f"스크립트 생성 중 오류 발생: {e}")
+                    st.error(f"Codex 실행 중 오류 발생: {e}")
+
+    st.divider()
+
+    # 하단: 실시간 Revit 모델 양방향 검수 (Live Model QA & Auto-Fix)
+    st.markdown("### C. 실시간 Revit 모델 양방향 검수 (Live Model QA & Auto-Fix)")
+    st.caption("현재 열려 있는 Revit 모델의 내부 데이터(레벨, 그리드, 등록된 공유 매개변수, 빈 속성값, 재료 RGB 등)를 실시간으로 읽어와 Vector DB의 기준 문서와 대조 검수합니다.")
+    
+    qa_focus_input = st.text_input(
+        "중점 검수 항목 입력",
+        value="현재 열려 있는 Revit 모델의 프로젝트 정보, 레벨/그리드 구성, 사내 표준 공유 매개변수 바인딩 및 속성값 입력 누락 여부, 재료 세팅 상태를 기준 문서와 비교해서 검수표를 작성해줘."
+    )
+    
+    if st.button("열려 있는 Revit 모델 실시간 스캔 및 AI 표준 검수 실행", use_container_width=True):
+        with st.spinner("실행 중인 Revit 모델 내부 데이터를 스캔하고 Vector DB 기준 문서와 대조 중입니다..."):
+            qa_ok, snapshot_data, qa_report_md, fix_code = run_live_model_qa(qa_focus_input, target_manuals=gen_manuals)
+            st.session_state["last_qa_ok"] = qa_ok
+            st.session_state["last_qa_snapshot"] = snapshot_data
+            st.session_state["last_qa_report"] = qa_report_md
+            st.session_state["last_qa_fix_code"] = fix_code
+
+    if "last_qa_report" in st.session_state and st.session_state["last_qa_report"]:
+        if st.session_state.get("last_qa_ok"):
+            st.success("실시간 Revit 모델 스캔 및 AI 양방향 검수 완료")
+            with st.expander("1. Revit에서 실시간 추출된 모델 원본 스냅샷 (JSON 데이터)", expanded=False):
+                st.json(st.session_state["last_qa_snapshot"])
+                
+            st.markdown("#### 2. AI 표준 대조 검수 보고서")
+            st.markdown(st.session_state["last_qa_report"])
+            
+            col_qa_btn1, col_qa_btn2 = st.columns(2)
+            with col_qa_btn1:
+                st.download_button(
+                    label="AI 모델 검수 보고서 다운로드 (Revit_Live_QA_Report.md)",
+                    data=st.session_state["last_qa_report"].encode("utf-8-sig"),
+                    file_name="Revit_Live_QA_Report.md",
+                    mime="text/markdown",
+                    use_container_width=True
+                )
+            with col_qa_btn2:
+                if st.session_state.get("last_qa_fix_code"):
+                    if st.button("검수 지적사항 Revit 모델에 즉시 자동 보정(Auto-Fix) 실행", use_container_width=True):
+                        with st.spinner("검수 지적사항 보정 코드를 Revit에 실시간 주입하고 있습니다..."):
+                            fix_ok, fix_logs, _, _ = execute_in_revit_with_self_healing(
+                                "양방향 검수 지적사항 자동 보정",
+                                target_manuals=gen_manuals,
+                                max_attempts=3,
+                                custom_code=st.session_state["last_qa_fix_code"]
+                            )
+                            if fix_ok:
+                                st.success("검수 지적사항이 Revit 모델에 자동으로 보정되었습니다!")
+                            else:
+                                st.warning("자동 보정 중 일부 항목을 브릿지에 저장했습니다. 로그를 확인하세요.")
+                            with st.expander("자동 보정 실행 로그", expanded=True):
+                                st.code("\n".join(fix_logs), language="text")
+        else:
+            st.error(st.session_state["last_qa_report"])
 
 # --- [탭 3: 전체 BIM 파일 카탈로그] ---
 with tab_catalog:
