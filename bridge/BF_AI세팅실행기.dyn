@@ -9,7 +9,7 @@
   "Inputs": [
     {
       "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
-      "Name": "AI 경로",
+      "Name": "AI 스크립트 경로 (자동연결)",
       "Type": "string",
       "Value": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py"
     }
@@ -17,7 +17,7 @@
   "Outputs": [
     {
       "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b",
-      "Name": "로그",
+      "Name": "실행 결과 로그",
       "Type": "var"
     }
   ],
@@ -26,31 +26,75 @@
       "ConcreteType": "CoreNodeModels.Input.Filename, CoreNodeModels",
       "HintPath": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
       "InputValue": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
+      "NodeType": "ExtensionNode",
       "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
+      "Inputs": [],
       "Outputs": [
         {
-          "Id": "11111111222233334444555566667777"
+          "Id": "11111111222233334444555566667777",
+          "Name": "",
+          "Description": "File Path",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
         }
       ]
     },
     {
       "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "NodeType": "PythonScriptNode",
       "Code": "import os\nimport traceback\nimport clr\nclr.AddReference('RevitAPI')\nclr.AddReference('RevitAPIUI')\nclr.AddReference('RevitServices')\nimport Autodesk\nfrom Autodesk.Revit.DB import *\nfrom Autodesk.Revit.UI import *\nfrom RevitServices.Persistence import DocumentManager\nfrom RevitServices.Transactions import TransactionManager\ndoc = DocumentManager.Instance.CurrentDBDocument\nuiapp = DocumentManager.Instance.CurrentUIApplication\nuidoc = uiapp.ActiveUIDocument\nTransactionManager.Instance.ForceCloseTransaction()\nscript_path = IN[0]\nif not script_path or not os.path.exists(script_path):\n    OUT = '[대기 중] 실행할 스크립트 파일이 없습니다: {}'.format(script_path)\nelse:\n    try:\n        with open(script_path, 'r', encoding='utf-8-sig') as f:\n            ai_code = f.read()\n        exec_scope = globals().copy()\n        exec_scope['doc'] = doc\n        exec_scope['uiapp'] = uiapp\n        exec_scope['uidoc'] = uidoc\n        exec_scope['__revit__'] = uiapp\n        exec(ai_code, exec_scope)\n        res_msg = exec_scope.get('RESULT_MSG', '세팅 완료')\n        OUT = '[AI 자동 세팅 성공] {}'.format(res_msg)\n    except Exception as e:\n        OUT = '[실행 오류] {}\n{}'.format(str(e), traceback.format_exc())",
       "Engine": "CPython3",
+      "VariableInputPorts": true,
       "Id": "99999999888877776666555544443333",
       "Inputs": [
         {
           "Id": "aaaaaaaabbbbccccddddeeeeffffffff",
-          "Name": "IN[0]"
+          "Name": "IN[0]",
+          "Description": "Script File Path",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "fedcba9876543210fedcba9876543210",
+          "Name": "OUT",
+          "Description": "Execution Result",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
         }
       ]
     },
     {
       "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "NodeType": "ExtensionNode",
       "Id": "f6e5d4c3b2a147898a1b2c3d4e5f6a7b",
       "Inputs": [
         {
-          "Id": "0123456789abcdef0123456789abcdef"
+          "Id": "0123456789abcdef0123456789abcdef",
+          "Name": "",
+          "Description": "Node to evaluate.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "abcdef0123456789abcdef0123456789",
+          "Name": "",
+          "Description": "Watch contents.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
         }
       ]
     }
@@ -59,17 +103,29 @@
     {
       "Start": "11111111222233334444555566667777",
       "End": "aaaaaaaabbbbccccddddeeeeffffffff",
-      "Id": "c1"
+      "Id": "c1111111222233334444555566667777",
+      "IsHidden": "False"
     },
     {
       "Start": "fedcba9876543210fedcba9876543210",
       "End": "0123456789abcdef0123456789abcdef",
-      "Id": "c2"
+      "Id": "c2222222333344445555666677778888",
+      "IsHidden": "False"
     }
   ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "ExtensionWorkspaceData": [],
+  "Author": "BIM AI Assistant",
+  "Bindings": [],
   "View": {
     "Dynamo": {
-      "Version": "2.19.3.6394"
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
     }
   }
 }
