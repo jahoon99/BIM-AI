@@ -2,6 +2,7 @@ import os
 import io
 import re
 import time
+import json
 import hashlib
 import tempfile
 from dotenv import load_dotenv
@@ -21,11 +22,13 @@ import openpyxl
 
 MIN_CHUNK_CHARS = 50
 MAX_EXCEL_CHUNKS_PER_SHEET = 15
+SCHEMA_VERSION = "v3.0"
+
 
 def classify_doc_category(file_name, ext):
     """파일명과 확장자 규칙을 기반으로 사내 표준 문서 분류(doc_category)를 자동 지정합니다."""
     name_lower = file_name.lower()
-    if any(k in name_lower for k in ['양식', '템플릿', 'template', '표준', '매개변수', 'parameter', '조달청']):
+    if any(k in name_lower for k in ['양식', '템플릿', 'template', '표준', '매개변수', 'parameter', '조달청', '지침', '가이드라인']):
         return "표준양식/세팅기준"
     elif any(k in name_lower for k in ['스펙', 'spec', '시방서', '재료', '마감']):
         return "스펙북/자재기준"
@@ -35,10 +38,10 @@ def classify_doc_category(file_name, ext):
         return "검토리스트"
     elif any(k in name_lower for k in ['수량', '물량', '산출', '비교표', '내역', 'boq', 'qto']):
         return "수량산출서"
-    elif any(k in name_lower for k in ['가이드', '매뉴얼', 'manual', 'guide', '지침']):
+    elif any(k in name_lower for k in ['가이드', '매뉴얼', 'manual', 'guide']):
         return "매뉴얼/가이드북"
     else:
-        return "검토리스트/수량산출서" if ext == 'xlsx' else "기타기술문서"
+        return "수량산출서" if ext == 'xlsx' else "기타기술문서"
 
 
 def detect_setup_topic(text):
@@ -57,7 +60,7 @@ def detect_setup_topic(text):
         topics.append("모델검토/QA기준")
     if any(k in t_lower for k in ['산출수식', '물량', '수량', '단열', '콘크리트', '합계']):
         topics.append("수량산출/적산기준")
-        
+
     return ", ".join(topics) if topics else "일반내용/개요"
 
 
@@ -71,10 +74,10 @@ def clean_and_filter_text(text):
 
 
 def extract_documents_from_file(temp_path, ext, base_meta):
-    """문서 포맷별 텍스트 추출, 중복 제거 및 세팅 주제(setup_topic) 메타데이터를 부여합니다."""
+    """문서 포맷별 텍스트 추출, 문맥 헤더(Contextual Header) 주입 및 동적 엑셀 병합을 수행합니다."""
     docs = []
     seen_hashes = set()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1800, chunk_overlap=200)
 
     def add_valid_chunk(content, location_str, chunk_type="일반본문"):
         cleaned = clean_and_filter_text(content)
@@ -85,12 +88,25 @@ def extract_documents_from_file(temp_path, ext, base_meta):
             return
         seen_hashes.add(content_hash)
 
+        topic_str = detect_setup_topic(cleaned)
+        # [핵심 최적화] Contextual Retrieval: 임베딩될 원문 상단에 문서명/분류/위치 문맥 헤더를 자동 주입
+        contextual_text = (
+            "[문서명: {0} | 분류: {1} | 위치: {2} | 주제: {3}]\n{4}".format(
+                base_meta["file_name"],
+                base_meta["doc_category"],
+                location_str,
+                topic_str,
+                cleaned
+            )
+        )
+
         meta = base_meta.copy()
         meta["location"] = location_str
         meta["chunk_type"] = chunk_type
-        meta["setup_topic"] = detect_setup_topic(cleaned)
-        meta["char_length"] = len(cleaned)
-        docs.append(Document(page_content=cleaned, metadata=meta))
+        meta["setup_topic"] = topic_str
+        meta["char_length"] = len(contextual_text)
+        meta["schema_version"] = SCHEMA_VERSION
+        docs.append(Document(page_content=contextual_text, metadata=meta))
 
     if ext == 'txt':
         with open(temp_path, 'rb') as f:
@@ -116,17 +132,17 @@ def extract_documents_from_file(temp_path, ext, base_meta):
                         p_name = parts[2]
                         p_type = parts[3]
                         p_group = groups.get(parts[5], parts[5])
-                        params.append(f"- 매개변수명: {p_name} | 자료형: {p_type} | 그룹: {p_group} | GUID: {p_guid}")
+                        params.append("- 매개변수명: {0} | 자료형: {1} | 그룹: {2} | GUID: {3}".format(p_name, p_type, p_group, p_guid))
                 if params:
                     param_summary = (
-                        f"[Revit 사내 표준 공유 매개변수(Shared Parameters) 원본 정의 - 파일: {base_meta['file_name']}]\n"
-                        f"총 등록된 매개변수 수: {len(params)}개\n" + "\n".join(params)
+                        "[Revit 사내 표준 공유 매개변수(Shared Parameters) 원본 정의 - 파일: {0}]\n"
+                        "총 등록된 매개변수 수: {1}개\n".format(base_meta['file_name'], len(params)) + "\n".join(params)
                     )
                     for idx, chunk in enumerate(text_splitter.split_text(param_summary), start=1):
-                        add_valid_chunk(chunk, f"공유매개변수 목록 #{idx}", "세팅기준데이터")
+                        add_valid_chunk(chunk, "공유매개변수 목록 #{0}".format(idx), "세팅기준데이터")
             else:
                 for idx, chunk in enumerate(text_splitter.split_text(text), start=1):
-                    add_valid_chunk(chunk, f"텍스트 섹션 #{idx}", "세팅기준데이터")
+                    add_valid_chunk(chunk, "텍스트 섹션 #{0}".format(idx), "세팅기준데이터")
 
     elif ext == 'pdf':
         reader = PdfReader(temp_path)
@@ -134,14 +150,24 @@ def extract_documents_from_file(temp_path, ext, base_meta):
             text = page.extract_text()
             if text:
                 for chunk in text_splitter.split_text(text):
-                    add_valid_chunk(chunk, f"{i + 1}페이지", "본문내용")
+                    add_valid_chunk(chunk, "{0}페이지".format(i + 1), "본문내용")
 
     elif ext == 'docx':
         doc = docx.Document(temp_path)
-        full_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        # DOCX 내 표(Table) 텍스트도 누락 없이 추출
+        for t_idx, table in enumerate(doc.tables, start=1):
+            t_rows = []
+            for row in table.rows:
+                r_txt = [cell.text.strip().replace('\n', ' ') for cell in row.cells if cell.text.strip()]
+                if r_txt:
+                    t_rows.append(" | ".join(r_txt))
+            if t_rows:
+                paragraphs.append("[문서 내 표 #{0}]\n".format(t_idx) + "\n".join(t_rows))
+        full_text = "\n".join(paragraphs)
         if full_text:
             for idx, chunk in enumerate(text_splitter.split_text(full_text), start=1):
-                add_valid_chunk(chunk, f"본문 섹션 #{idx}", "본문내용")
+                add_valid_chunk(chunk, "본문 섹션 #{0}".format(idx), "본문내용")
 
     elif ext == 'pptx':
         prs = Presentation(temp_path)
@@ -160,7 +186,7 @@ def extract_documents_from_file(temp_path, ext, base_meta):
             full_slide_text = "\n".join(slide_texts)
             if full_slide_text:
                 for chunk in text_splitter.split_text(full_slide_text):
-                    add_valid_chunk(chunk, f"슬라이드 {i + 1}장", "보고서슬라이드")
+                    add_valid_chunk(chunk, "슬라이드 {0}장".format(i + 1), "보고서슬라이드")
 
     elif ext == 'xlsx':
         wb_val = openpyxl.load_workbook(temp_path, data_only=True)
@@ -177,13 +203,13 @@ def extract_documents_from_file(temp_path, ext, base_meta):
 
             header_idx = 0
             max_non_empty = 0
-            for idx in range(min(5, len(rows_val))):
+            for idx in range(min(10, len(rows_val))):
                 non_empty = sum(1 for c in rows_val[idx] if c is not None and str(c).strip() != "")
                 if non_empty > max_non_empty:
                     max_non_empty = non_empty
                     header_idx = idx
 
-            headers = [str(h).strip().replace('\n', ' ') if h is not None else f"열{i+1}" for i, h in enumerate(rows_val[header_idx])]
+            headers = [str(h).strip().replace('\n', ' ') if h is not None else "열{0}".format(i + 1) for i, h in enumerate(rows_val[header_idx])]
             valid_headers = [h for h in headers if not h.startswith("열")]
 
             formula_samples = []
@@ -191,60 +217,71 @@ def extract_documents_from_file(temp_path, ext, base_meta):
             for r_i in range(header_idx + 1, len(rows_form)):
                 r_f = rows_form[r_i]
                 r_v = rows_val[r_i]
-                if len(formula_samples) < 5:
+                if len(formula_samples) < 8:
                     for h_name, f_cell, v_cell in zip(headers, r_f, r_v):
                         if isinstance(f_cell, str) and f_cell.startswith('='):
-                            formula_samples.append(f"[{h_name}] 산출수식: {f_cell} (결과예시: {v_cell})")
+                            sample_str = "[{0}] 산출수식: {1} (계산값 예시: {2})".format(h_name, f_cell, v_cell)
+                            if sample_str not in formula_samples:
+                                formula_samples.append(sample_str)
                 row_str_joined = " ".join([str(c) for c in r_v if c is not None])
-                if any(k in row_str_joined for k in ['합계', '소계', '총계', '계', '비교', '차이']) and len(summary_rows) < 10:
-                    items = [f"{h}: {str(v).strip()}" for h, v in zip(headers, r_v) if v is not None and str(v).strip() != ""]
-                    summary_rows.append(f"({r_i+1}행 요약) " + " | ".join(items))
+                if any(k in row_str_joined for k in ['합계', '소계', '총계', '계', '비교', '차이', '총괄']) and len(summary_rows) < 12:
+                    items = ["{0}: {1}".format(h, str(v).strip()) for h, v in zip(headers, r_v) if v is not None and str(v).strip() != ""]
+                    summary_rows.append("({0}행 요약) ".format(r_i + 1) + " | ".join(items))
 
             structure_summary = (
-                f"[엑셀 양식 및 작성 방법 요약 - 파일: {base_meta['file_name']} / 시트: {sheet}]\n"
-                f"- 전체 데이터 행 수: 총 {len(rows_val) - header_idx - 1}행\n"
-                f"- 표 컬럼(양식 항목) 구성: {', '.join(valid_headers)}\n"
-                f"- 적용된 주요 산출 수식(Formula) 예시:\n  " + ("\n  ".join(formula_samples) if formula_samples else "별도 수식 없음(단순 값 기입 방식)") + "\n"
-                f"- 시트 내 주요 합계/비교 요약 행:\n  " + ("\n  ".join(summary_rows) if summary_rows else "별도 합계 행 없음")
+                "[엑셀 양식 및 산출 방법 요약 - 파일: {0} / 시트: {1}]\n"
+                "- 전체 데이터 행 수: 총 {2}행\n"
+                "- 표 컬럼(양식 항목) 구성: {3}\n"
+                "- 적용된 주요 산출 수식(Formula) 예시:\n  {4}\n"
+                "- 시트 내 주요 합계/비교 요약 행:\n  {5}".format(
+                    base_meta['file_name'],
+                    sheet,
+                    len(rows_val) - header_idx - 1,
+                    ', '.join(valid_headers),
+                    "\n  ".join(formula_samples) if formula_samples else "별도 수식 없음(단순 값 기입 방식)",
+                    "\n  ".join(summary_rows) if summary_rows else "별도 합계 행 없음"
+                )
             )
-            add_valid_chunk(structure_summary, f"{sheet} 시트 (양식/산출식 구조)", "양식및산출기준")
+            add_valid_chunk(structure_summary, "{0} 시트 (양식/산출식 구조)".format(sheet), "양식및산출기준")
+
+            # [핵심 보완] 행 데이터 누락 방지를 위한 동적 행 병합 크기(rows_per_chunk) 산출
+            total_data_rows = max(1, len(rows_val) - (header_idx + 1))
+            rows_per_chunk = max(25, (total_data_rows // MAX_EXCEL_CHUNKS_PER_SHEET) + 1)
 
             batch_rows_text = []
             start_row_num = header_idx + 2
-            sheet_chunk_count = 0
 
             for r_idx in range(header_idx + 1, len(rows_val)):
                 row = rows_val[r_idx]
-                row_items = [f"{h}: {str(val).strip()}" for h, val in zip(headers, row) if val is not None and str(val).strip() != ""]
+                row_items = ["{0}: {1}".format(h, str(val).strip()) for h, val in zip(headers, row) if val is not None and str(val).strip() != ""]
                 if row_items:
-                    batch_rows_text.append(f"({r_idx+1}행) " + " | ".join(row_items))
+                    batch_rows_text.append("({0}행) ".format(r_idx + 1) + " | ".join(row_items))
 
-                if len(batch_rows_text) >= 25 or r_idx == len(rows_val) - 1:
-                    if batch_rows_text and sheet_chunk_count < MAX_EXCEL_CHUNKS_PER_SHEET:
-                        combined_text = f"[{sheet} 시트 {start_row_num}~{r_idx+1}행 데이터]\n" + "\n".join(batch_rows_text)
-                        add_valid_chunk(combined_text, f"{sheet} 시트 {start_row_num}~{r_idx+1}행", "세부데이터")
-                        sheet_chunk_count += 1
+                if len(batch_rows_text) >= rows_per_chunk or r_idx == len(rows_val) - 1:
+                    if batch_rows_text:
+                        combined_text = "[{0} 시트 {1}~{2}행 데이터]\n".format(sheet, start_row_num, r_idx + 1) + "\n".join(batch_rows_text)
+                        add_valid_chunk(combined_text, "{0} 시트 {1}~{2}행".format(sheet, start_row_num, r_idx + 1), "세부데이터")
                     batch_rows_text = []
                     start_row_num = r_idx + 2
 
     return docs
 
 
-def embed_with_rate_limit(embeddings, texts, batch_size=100):
-    """무한 루프 방지 및 API 효율 극대화를 위한 임베딩 함수입니다."""
+def embed_with_rate_limit(embeddings, texts, batch_size=80):
+    """무한 루프 방지 및 API 할당량 제어를 위한 배치 임베딩 함수입니다."""
     all_vectors = []
     total = len(texts)
     max_retries = 3
-    
+
     for i in range(0, total, batch_size):
         batch = texts[i : i + batch_size]
         retry_count = 0
-        
+
         while True:
             try:
                 vectors = embeddings.embed_documents(batch)
                 all_vectors.extend(vectors)
-                print(f"     ... 임베딩 진행률: {min(i + batch_size, total)} / {total} 조각 완료")
+                print("     ... 임베딩 진행률: {0} / {1} 조각 완료".format(min(i + batch_size, total), total))
                 if i + batch_size < total:
                     time.sleep(2)
                 break
@@ -253,10 +290,10 @@ def embed_with_rate_limit(embeddings, texts, batch_size=100):
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     retry_count += 1
                     if retry_count > max_retries:
-                        print("\n[치명적 오류] 일일 무료 할당량이 고갈되었습니다. 작업을 강제 종료합니다.")
+                        print("\n[치명적 오류] 일일 무료 할당량이 고갈되었습니다. 작업을 안전하게 종료합니다.")
                         raise e
                     wait_sec = 45
-                    print(f"   -> [API 할당량 대기] {wait_sec}초 대기 후 재시도... ({retry_count}/{max_retries}회)")
+                    print("   -> [API 할당량 대기] {0}초 대기 후 재시도... ({1}/{2}회)".format(wait_sec, retry_count, max_retries))
                     time.sleep(wait_sec)
                 else:
                     raise e
@@ -264,26 +301,73 @@ def embed_with_rate_limit(embeddings, texts, batch_size=100):
 
 
 def get_all_files_recursively(drive_service, folder_id):
-    """폴더 및 하위 폴더의 모든 파일 목록을 재귀적으로 스캔합니다."""
+    """지정된 드라이브 폴더와 모든 하위 폴더를 재귀 스캔합니다."""
+    if not folder_id:
+        return []
     all_files = []
     folders_to_scan = [folder_id]
+    visited_folders = set()
+
     while folders_to_scan:
         current_folder = folders_to_scan.pop(0)
-        query = f"'{current_folder}' in parents and trashed = false"
-        results = drive_service.files().list(
-            q=query, pageSize=1000,
-            fields="files(id, name, mimeType, fileExtension, webViewLink, modifiedTime)"
-        ).execute()
-        for item in results.get('files', []):
-            if item.get('mimeType') == 'application/vnd.google-apps.folder':
-                folders_to_scan.append(item.get('id'))
-            else:
-                all_files.append(item)
+        if current_folder in visited_folders:
+            continue
+        visited_folders.add(current_folder)
+
+        page_token = None
+        while True:
+            query = "'{0}' in parents and trashed = false".format(current_folder)
+            results = drive_service.files().list(
+                q=query,
+                pageSize=1000,
+                pageToken=page_token,
+                fields="nextPageToken, files(id, name, mimeType, fileExtension, webViewLink, modifiedTime)"
+            ).execute()
+            for item in results.get('files', []):
+                if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                    folders_to_scan.append(item.get('id'))
+                else:
+                    all_files.append(item)
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
     return all_files
 
 
+def filter_duplicate_pdf_files(drive_files):
+    """동일한 파일명의 원본(.pptx, .docx, .xlsx)과 변환본(.pdf)이 공존할 경우 원본만 남기고 .pdf를 자동 제외합니다."""
+    editable_basenames = set()
+    for f in drive_files:
+        fname = f.get('name', '')
+        mime = f.get('mimeType', '')
+        ext = f.get('fileExtension', '').lower()
+        if not ext and '.' in fname:
+            ext = fname.rsplit('.', 1)[-1].lower()
+        if mime in {'application/vnd.google-apps.spreadsheet', 'application/vnd.google-apps.presentation', 'application/vnd.google-apps.document'}:
+            base = fname.rsplit('.', 1)[0].strip().lower()
+            editable_basenames.add(base)
+        elif ext in {'pptx', 'docx', 'xlsx'}:
+            base = fname.rsplit('.', 1)[0].strip().lower()
+            editable_basenames.add(base)
+
+    filtered = []
+    skipped_pdfs = []
+    for f in drive_files:
+        fname = f.get('name', '')
+        ext = f.get('fileExtension', '').lower()
+        if not ext and '.' in fname:
+            ext = fname.rsplit('.', 1)[-1].lower()
+        base = fname.rsplit('.', 1)[0].strip().lower()
+        if ext == 'pdf' and base in editable_basenames:
+            skipped_pdfs.append(fname)
+            continue
+        filtered.append(f)
+
+    return filtered, skipped_pdfs
+
+
 def ingest_manuals_to_chroma(force_rebuild=False):
-    print("=== [Step 1-B: 표준 분류 체계 및 세팅 기준 Vector DB 동기화 시작] ===\n")
+    print("=== [Step 1-B: Vector DB v3.0 최적화 동기화(문맥주입/중복차단/누락방지) 시작] ===\n")
 
     load_dotenv()
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -294,24 +378,28 @@ def ingest_manuals_to_chroma(force_rebuild=False):
 
     chroma_client = chromadb.PersistentClient(path=chroma_path)
     if force_rebuild:
-        print("[초기화] 기존 Vector DB 컬렉션을 삭제하고 새로운 표준 규격으로 재구축합니다...")
+        print("[초기화] 기존 Vector DB 컬렉션을 삭제하고 v3.0 코사인(Cosine) 표준 규격으로 재구축합니다...")
         try:
             chroma_client.delete_collection(name="bim_manuals")
         except Exception:
             pass
 
-    collection = chroma_client.get_or_create_collection(name="bim_manuals")
+    # [핵심 최적화] 코사인 유사도(cosine) 거리 공간 지정
+    collection = chroma_client.get_or_create_collection(
+        name="bim_manuals",
+        metadata={"hnsw:space": "cosine"}
+    )
 
     existing_data = collection.get(include=["metadatas"])
     existing_files = {}
     for meta in existing_data.get("metadatas", []):
         if meta and "file_id" in meta:
-            if "doc_category" not in meta or "setup_topic" not in meta:
+            if meta.get("schema_version") != SCHEMA_VERSION:
                 existing_files[meta["file_id"]] = "NEED_UPGRADE"
             else:
                 existing_files[meta["file_id"]] = meta.get("modified_time", "")
 
-    print(f"1. 현재 Vector DB에 등록된 문서 파일 수: {len(existing_files)}개")
+    print("1. 현재 Vector DB에 등록된 문서 파일 수: {0}개".format(len(existing_files)))
 
     drive_scope = "https://" + "www.googleapis.com/auth/drive.readonly"
     creds = Credentials.from_service_account_file(key_path, scopes=[drive_scope])
@@ -320,17 +408,22 @@ def ingest_manuals_to_chroma(force_rebuild=False):
     manual_files = get_all_files_recursively(drive_service, manual_folder_id)
     bim_files = get_all_files_recursively(drive_service, bim_folder_id)
     unique_drive_files = {f.get('id'): f for f in manual_files + bim_files}
-    drive_files = list(unique_drive_files.values())
+    all_scanned_files = list(unique_drive_files.values())
 
-    drive_file_ids = set(unique_drive_files.keys())
-    deleted_ids = set(existing_files.keys()) - drive_file_ids
+    # 동일 파일명 PDF 자동 중복 차단
+    drive_files, skipped_pdfs = filter_duplicate_pdf_files(all_scanned_files)
+    if skipped_pdfs:
+        print("2. [중복 자동 차단] 원본(.pptx/.docx)과 중복되는 PDF {0}건 자동 제외: {1}".format(len(skipped_pdfs), ", ".join(skipped_pdfs)))
+
+    valid_drive_ids = {f.get('id') for f in drive_files}
+    deleted_ids = set(existing_files.keys()) - valid_drive_ids
     deleted_count = 0
 
     if deleted_ids:
         for del_id in deleted_ids:
             collection.delete(where={"file_id": del_id})
             deleted_count += 1
-        print(f"2. 삭제된 파일 정리: {deleted_count}개 문서 제거 완료\n")
+        print("3. [삭제/중복 정리] 드라이브에서 삭제되었거나 중복 제외된 문서 {0}건 Vector DB에서 제거 완료\n".format(deleted_count))
 
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
@@ -370,28 +463,28 @@ def ingest_manuals_to_chroma(force_rebuild=False):
         is_update = False
         if file_id in existing_files:
             if existing_files[file_id] == drive_mod_time:
-                print(f" - [유지] [{doc_category}] '{file_name}' (최신 표준 적용됨)")
+                print(" - [유지] [{0}] '{1}' (v3.0 최신 상태)".format(doc_category, file_name))
                 continue
             else:
-                print(f" - [표준화 업그레이드/변경] [{doc_category}] '{file_name}' 재학습 중...")
-                collection.delete(where={"file_id": file_id})
+                print(" - [업그레이드/변경 감지] [{0}] '{1}' 재학습 중...".format(doc_category, file_name))
                 is_update = True
         else:
-            print(f" - [신규 처리] [{doc_category}] '{file_name}' 추출 중...")
+            print(" - [신규 파일 감지] [{0}] '{1}' 텍스트 추출 중...".format(doc_category, file_name))
 
+        temp_path = None
         try:
             if export_mime:
                 request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
             else:
                 request = drive_service.files().get_media(fileId=file_id)
-                
+
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request)
             done = False
             while not done:
                 status, done = downloader.next_chunk()
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as temp_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".{0}".format(ext)) as temp_file:
                 temp_file.write(fh.getvalue())
                 temp_path = temp_file.name
 
@@ -403,35 +496,40 @@ def ingest_manuals_to_chroma(force_rebuild=False):
                 "drive_link": file.get('webViewLink', ''),
                 "modified_time": drive_mod_time
             }
-            
+
             docs = extract_documents_from_file(temp_path, ext, base_meta)
 
             if docs:
                 texts = [doc.page_content for doc in docs]
                 metadatas = [doc.metadata for doc in docs]
-                ids = [f"{file_id}_chunk_{i}" for i in range(len(docs))]
+                ids = ["{0}_chunk_{1}".format(file_id, i) for i in range(len(docs))]
 
-                print(f"   -> 경량화 후 유효 조각 수: {len(docs)}개 (임베딩 시작...)")
-                vectors = embed_with_rate_limit(embeddings, texts, batch_size=100)
-                
+                print("   -> 문맥 헤더 주입 및 정제 완료: 총 {0}개 조각 (임베딩 시작...)".format(len(docs)))
+                vectors = embed_with_rate_limit(embeddings, texts, batch_size=80)
+
+                # [원자성 보장] 임베딩이 100% 성공한 직후에만 기존 조각을 지우고 새 조각을 적재
+                if is_update:
+                    collection.delete(where={"file_id": file_id})
                 collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metadatas)
+
                 if is_update:
                     updated_count += 1
                 else:
                     new_count += 1
-                print(f"   -> 완료: '{file_name}' 적재 성공\n")
+                print("   -> 완료: '{0}' Vector DB 적재 성공\n".format(file_name))
             else:
-                print(f"   -> [경고] '{file_name}'에서 유효한 텍스트가 추출되지 않았습니다.\n")
+                print("   -> [경고] '{0}'에서 유효한 텍스트가 추출되지 않았습니다.\n".format(file_name))
 
         except Exception as e:
-            print(f"   -> [오류 발생] '{file_name}' 처리 실패: {e}\n")
+            print("   -> [오류 발생] '{0}' 처리 실패 (기존 DB 데이터는 보존됨): {1}\n".format(file_name, e))
 
         finally:
-            if 'temp_path' in locals() and os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    print(f"\n3. 작업 요약: 신규 {new_count}개 / 표준화갱신 {updated_count}개 / 삭제 {deleted_count}개")
-    print("=== [Vector DB 동기화 종료] ===")
+    print("\n4. 작업 요약: 신규 {0}개 / 갱신 {1}개 / 삭제·중복제거 {2}개".format(new_count, updated_count, deleted_count))
+    print("=== [Vector DB v3.0 완전 동기화 종료] ===")
+
 
 if __name__ == "__main__":
     ingest_manuals_to_chroma()
