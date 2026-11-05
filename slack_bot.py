@@ -1,5 +1,9 @@
 import os
 import re
+import time
+import datetime
+import threading
+import traceback
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -8,14 +12,19 @@ from backend.bim_agent import (
     get_ai_response,
     get_cached_sheet_records,
     get_indexed_manual_list,
+    get_indexed_categories,
     generate_revit_shared_param_file,
     generate_revit_setup_script
 )
+from data_pipeline.sync_bim_metadata import sync_drive_to_sheets
+from data_pipeline.ingest_manuals import ingest_manuals_to_chroma
 
-# 1. 환경변수 로드 및 토큰 검증
 load_dotenv()
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+
+# 자동 동기화 주기: 6시간 (21600초)
+SYNC_INTERVAL_SECONDS = 21600
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise ValueError(".env 파일에 SLACK_BOT_TOKEN(xoxb-...)과 SLACK_APP_TOKEN(xapp-...)이 설정되어 있는지 확인하세요.")
@@ -23,25 +32,43 @@ if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
 app = App(token=SLACK_BOT_TOKEN)
 
 
+def background_auto_sync_loop():
+    """별도 창을 띄우지 않고 슬랙 봇 내부 백그라운드 스레드에서 6시간 주기로 구글 드라이브 동기화를 수행합니다."""
+    # 최초 구동 시 슬랙 봇 연결 안정화를 위해 10초 대기 후 첫 점검 시작
+    time.sleep(10)
+    while True:
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print("\n[자동 동기화 스케줄러 | {0}] 구글 드라이브 변경사항 점검을 시작합니다...".format(now_str))
+        try:
+            sync_drive_to_sheets()
+            get_cached_sheet_records(force_refresh=True)
+        except Exception as e:
+            print(" -> [경고] BIM 파일 시트 동기화 오류: {0}".format(e))
+            traceback.print_exc()
+
+        try:
+            ingest_manuals_to_chroma(force_rebuild=False)
+        except Exception as e:
+            print(" -> [경고] 매뉴얼 Vector DB 동기화 오류: {0}".format(e))
+            traceback.print_exc()
+
+        next_time = (datetime.datetime.now() + datetime.timedelta(seconds=SYNC_INTERVAL_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
+        print("[자동 동기화 완료] 다음 정기 동기화 시각: {0}\n".format(next_time))
+        time.sleep(SYNC_INTERVAL_SECONDS)
+
+
 def convert_markdown_to_slack(md_text):
     """표준 마크다운 문법을 슬랙 전용 mrkdwn 문법으로 변환합니다."""
     if not md_text:
         return ""
-    
-    # 1. 마크다운 링크 [텍스트](URL) -> 슬랙 링크 <URL|텍스트> 변환
     converted = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<\2|\1>', md_text)
-    
-    # 2. 굵은 글씨 **텍스트** -> *텍스트* 변환
     converted = re.sub(r'\*\*([^\*]+)\*\*', r'*\1*', converted)
-    
-    # 3. 제목 ### 텍스트 -> *텍스트* 변환
     converted = re.sub(r'^#{1,4}\s*(.+)$', r'*\1*', converted, flags=re.MULTILINE)
-    
-    # 4. 마크다운 표(| 컬럼 |)가 있을 경우 슬랙에서 줄이 어긋나지 않도록 코드블록(```)으로 감싸기
+
     lines = converted.splitlines()
     out_lines = []
     in_table = False
-    
+
     for line in lines:
         stripped = line.strip()
         is_table_row = stripped.startswith('|') and stripped.endswith('|')
@@ -52,10 +79,10 @@ def convert_markdown_to_slack(md_text):
             out_lines.append("```")
             in_table = False
         out_lines.append(line)
-        
+
     if in_table:
         out_lines.append("```")
-        
+
     return "\n".join(out_lines)
 
 
@@ -78,10 +105,10 @@ def fetch_thread_history(client, channel_id, thread_ts, current_ts):
 
 
 def build_bim_modal_view(default_task="search", default_channel=None):
-    """슬래시 커맨드(/bim) 및 홈 탭 버튼 클릭 시 띄워줄 Block Kit 모달 팝업창 UI를 생성합니다."""
+    """슬래시 커맨드(/bim) 및 홈 탭 버튼 클릭 시 띄워줄 9대 분류 기반 Block Kit 모달 팝업창을 생성합니다."""
     manual_list = get_indexed_manual_list()
-    
-    # 슬랙 옵션 텍스트는 최대 75자 제한이 있으므로 안전하게 슬라이싱 처리
+    dynamic_categories = get_indexed_categories()
+
     manual_options = []
     for fname in manual_list[:90]:
         display_name = fname[:70] + "..." if len(fname) > 70 else fname
@@ -102,15 +129,10 @@ def build_bim_modal_view(default_task="search", default_channel=None):
     ]
     initial_task_option = next((opt for opt in task_options if opt["value"] == default_task), task_options[0])
 
-    category_options = [
-        {"text": {"type": "plain_text", "text": "전체 분류"}, "value": "전체 분류"},
-        {"text": {"type": "plain_text", "text": "표준양식/세팅기준"}, "value": "표준양식/세팅기준"},
-        {"text": {"type": "plain_text", "text": "스펙북/자재기준"}, "value": "스펙북/자재기준"},
-        {"text": {"type": "plain_text", "text": "검토보고서"}, "value": "검토보고서"},
-        {"text": {"type": "plain_text", "text": "검토리스트"}, "value": "검토리스트"},
-        {"text": {"type": "plain_text", "text": "수량산출서"}, "value": "수량산출서"},
-        {"text": {"type": "plain_text", "text": "매뉴얼/가이드북"}, "value": "매뉴얼/가이드북"}
-    ]
+    category_options = [{"text": {"type": "plain_text", "text": "전체 분류"}, "value": "전체 분류"}]
+    for cat in dynamic_categories[:40]:
+        cat_disp = cat[:70]
+        category_options.append({"text": {"type": "plain_text", "text": cat_disp}, "value": cat})
 
     blocks = [
         {
@@ -128,7 +150,7 @@ def build_bim_modal_view(default_task="search", default_channel=None):
             "type": "input",
             "block_id": "category_block",
             "optional": True,
-            "label": {"type": "plain_text", "text": "업무 목적별 문서 분류 필터 (검색 시 적용)"},
+            "label": {"type": "plain_text", "text": "업무 목적별 9대 문서 분류 필터 (검색 시 적용)"},
             "element": {
                 "type": "static_select",
                 "action_id": "category_select",
@@ -158,13 +180,12 @@ def build_bim_modal_view(default_task="search", default_channel=None):
                 "multiline": True,
                 "placeholder": {
                     "type": "plain_text",
-                    "text": "예시 1 (검색/비교): 다룩스와 트림블 가이드북의 뷰어 필터 차이점과 초기 세팅법 비교해줘\n예시 2 (매개변수): 조달청 기준 구조/토목 필수 매개변수 추가해서 파일 만들어줘\n예시 3 (세팅코드): 층고 4200mm 지상 5층 레벨 및 8000mm 간격 그리드 생성 코드 만들어줘"
+                    "text": "예시 1 (검색/비교): 조달청 지침서와 사내 기준의 매개변수 차이점 비교해줘\n예시 2 (매개변수): 조달청 기준 구조/토목 필수 매개변수 추가해서 파일 만들어줘\n예시 3 (세팅코드): 층고 4200mm 지상 5층 레벨 및 8000mm 간격 그리드 생성 코드 만들어줘"
                 }
             }
         }
     ]
 
-    # 결과를 전송받을 채널 선택기 (기본값: 명령어를 실행한 채널 또는 본인 DM)
     channel_element = {
         "type": "conversations_select",
         "action_id": "channel_select",
@@ -213,7 +234,7 @@ def publish_app_home(client, user_id):
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    "사내 표준 양식, 검토보고서 비교, 수량산출 기준 검색 및 Revit 초기 세팅 파일(`.txt`, `.py`) 생성을 지원하는 AI 플랫폼입니다.\n"
+                    "사내 9대 표준 문서(지침서, 검토보고서, 수량산출서, 견적서, 기술제안서 등) 비교 검색 및 Revit 세팅 파일(`.txt`, `.py`) 생성을 지원하는 AI 플랫폼입니다.\n"
                     "어느 채팅방에서든 `/bim`을 입력하거나 아래 버튼을 클릭하여 작업을 시작하세요."
                 )
             }
@@ -224,9 +245,9 @@ def publish_app_home(client, user_id):
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*[실시간 데이터베이스 연동 현황]*\n"
-                    f"- *Vector DB 학습 문서 수:* `{len(manual_list)}개` ({manual_preview})\n"
-                    f"- *Google Sheets 등록 BIM 자산(패밀리/템플릿):* `{bim_count}개`"
+                    "*[실시간 데이터베이스 연동 현황]*\n"
+                    "- *Vector DB 학습 문서 수:* `{0}개` ({1})\n"
+                    "- *Google Sheets 등록 BIM 자산(모델/패밀리/템플릿):* `{2}개`".format(len(manual_list), manual_preview, bim_count)
                 )
             }
         },
@@ -260,19 +281,6 @@ def publish_app_home(client, user_id):
                     "action_id": "refresh_sheet_cache_btn"
                 }
             ]
-        },
-        {"type": "divider"},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*[채팅창 직접 호출 가이드]*\n"
-                    "1. *슬래시 커맨드:* 채팅창에 `/bim` 입력 시 필터 선택 팝업창 호출\n"
-                    "2. *채널 멘션:* 채널에서 `@BIM 데이터 어시스턴트 질문내용` 입력\n"
-                    "3. *단축 명령어:* `!매개변수 요구사항` 또는 `!세팅코드 요구사항` 입력 시 즉시 파일 첨부"
-                )
-            }
         }
     ]
 
@@ -290,7 +298,7 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
 
     if task_type == "param":
         temp_msg = client.chat_postMessage(
-            text=f"<@{user_id}> 요청하신 기준으로 Revit 공유 매개변수(`.txt`) 파일을 생성하고 있습니다...",
+            text="<@{0}> 요청하신 기준으로 Revit 공유 매개변수(`.txt`) 파일을 생성하고 있습니다...".format(user_id),
             **post_kwargs
         )
         try:
@@ -301,9 +309,9 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
                 "filename": "BF_Custom_SharedParams.txt",
                 "title": "Revit 공유 매개변수 파일 (BF_Custom_SharedParams.txt)",
                 "initial_comment": (
-                    f"*[공유 매개변수 파일 생성 완료]* (요청자: <@{user_id}>)\n"
-                    f"- *요구사항:* {query_text}\n"
-                    f"- *생성된 매개변수 수:* 총 `{len(param_list)}개` (UTF-16 Revit 표준 포맷)"
+                    "*[공유 매개변수 파일 생성 완료]* (요청자: <@{0}>)\n"
+                    "- *요구사항:* {1}\n"
+                    "- *생성된 매개변수 수:* 총 `{2}개` (UTF-16 Revit 표준 포맷)".format(user_id, query_text, len(param_list))
                 )
             }
             if thread_ts:
@@ -311,11 +319,11 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
             client.files_upload_v2(**upload_kwargs)
             client.chat_delete(channel=channel_id, ts=temp_msg["ts"])
         except Exception as e:
-            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text=f"매개변수 파일 생성 중 오류가 발생했습니다: {e}")
+            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text="매개변수 파일 생성 중 오류가 발생했습니다: {0}".format(e))
 
     elif task_type == "script":
         temp_msg = client.chat_postMessage(
-            text=f"<@{user_id}> 요청하신 프로젝트 세팅 기준으로 Revit API 자동화 스크립트(`.py`)를 생성하고 있습니다...",
+            text="<@{0}> 요청하신 프로젝트 세팅 기준으로 Revit API 자동화 스크립트(`.py`)를 생성하고 있습니다...".format(user_id),
             **post_kwargs
         )
         try:
@@ -327,8 +335,8 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
                 "filename": "Revit_Auto_Setup.py",
                 "title": "Revit 자동 세팅 스크립트 (Revit_Auto_Setup.py)",
                 "initial_comment": (
-                    f"*[Revit 자동 세팅 스크립트 생성 완료]* (요청자: <@{user_id}>)\n"
-                    f"- *요구사항:* {query_text}\n\n{slack_desc[:1500]}"
+                    "*[Revit 자동 세팅 스크립트 생성 완료]* (요청자: <@{0}>)\n"
+                    "- *요구사항:* {1}\n\n{2}".format(user_id, query_text, slack_desc[:1500])
                 )
             }
             if thread_ts:
@@ -336,12 +344,14 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
             client.files_upload_v2(**upload_kwargs)
             client.chat_delete(channel=channel_id, ts=temp_msg["ts"])
         except Exception as e:
-            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text=f"세팅 스크립트 생성 중 오류가 발생했습니다: {e}")
+            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text="세팅 스크립트 생성 중 오류가 발생했습니다: {0}".format(e))
 
     else:
-        filter_info = f"분류: {target_category} | 지정문서: {', '.join(target_manuals) if target_manuals else '전체 자동 분산'}"
+        filter_info = "분류: {0} | 지정문서: {1}".format(
+            target_category, ", ".join(target_manuals) if target_manuals else "전체 자동 분산"
+        )
         temp_msg = client.chat_postMessage(
-            text=f"<@{user_id}> 사내 Vector DB와 구글 드라이브를 검색 및 분석 중입니다... (`{filter_info}`)",
+            text="<@{0}> 사내 Vector DB와 구글 드라이브를 검색 및 분석 중입니다... (`{1}`)".format(user_id, filter_info),
             **post_kwargs
         )
         try:
@@ -354,8 +364,9 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
                 target_category=target_category
             )
             slack_formatted_answer = (
-                f"*[질문]* {query_text} (요청자: <@{user_id}> | `{filter_info}`)\n\n"
-                f"{convert_markdown_to_slack(ai_answer)}"
+                "*[질문]* {0} (요청자: <@{1}> | `{2}`)\n\n{3}".format(
+                    query_text, user_id, filter_info, convert_markdown_to_slack(ai_answer)
+                )
             )
             client.chat_update(channel=channel_id, ts=temp_msg["ts"], text=slack_formatted_answer)
 
@@ -371,25 +382,24 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
                     upload_kwargs["thread_ts"] = thread_ts
                 client.files_upload_v2(**upload_kwargs)
         except Exception as e:
-            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text=f"데이터베이스 검색 중 오류가 발생했습니다: {e}")
+            client.chat_update(channel=channel_id, ts=temp_msg["ts"], text="데이터베이스 검색 중 오류가 발생했습니다: {0}".format(e))
 
 
 def process_bim_query(event, say, client):
-    """일반 채팅창(@멘션 또는 DM)에서 텍스트로 입력된 질문을 처리합니다."""
     channel_id = event.get("channel")
     user_id = event.get("user")
     user_ts = event.get("ts")
     thread_ts = event.get("thread_ts", user_ts)
-    
+
     raw_text = event.get("text", "")
     clean_query = re.sub(r'<@[A-Z0-9]+>', '', raw_text).strip()
-    
+
     if not clean_query:
         say(
             text=(
                 "안녕하세요! *BIM 데이터 어시스턴트*입니다.\n"
-                "- *팝업 UI 호출:* 채팅창에 `/bim`을 입력하면 문서 필터 및 기능 선택 창이 열립니다.\n"
-                "- *일반 검색/비교:* `키움 사옥 단열 수량 비교표 찾아줘` 또는 `다룩스와 트림블 차이점 비교해줘`\n"
+                "- *팝업 UI 호출:* 채팅창에 `/bim`을 입력하면 9대 문서 분류 필터 및 기능 선택 창이 열립니다.\n"
+                "- *일반 검색/비교:* `조달청 지침과 사내 기준 비교해줘` 또는 `키움 단열 수량 비교표 찾아줘`\n"
                 "- *공유 매개변수 생성:* `!매개변수 조달청 기준 구조/토목 필수 매개변수 파일 만들어줘`\n"
                 "- *Revit 세팅 코드 생성:* `!세팅코드 층고 4.2m 지상 5층 레벨 및 8m 그리드 세팅 코드 만들어줘`"
             ),
@@ -410,9 +420,6 @@ def process_bim_query(event, say, client):
     execute_task_and_post(client, channel_id, user_id, "search", clean_query, thread_ts=thread_ts)
 
 
-# --- [슬랙 이벤트 및 인터랙션 핸들러 등록] ---
-
-# 1. 슬랙 홈 탭(App Home) 진입 시 대시보드 렌더링
 @app.event("app_home_opened")
 def handle_app_home_opened(client, event):
     user_id = event.get("user")
@@ -420,7 +427,6 @@ def handle_app_home_opened(client, event):
         publish_app_home(client, user_id)
 
 
-# 2. 슬래시 커맨드(/bim) 입력 시 모달 팝업창 호출
 @app.command("/bim")
 def handle_bim_slash_command(ack, body, client):
     ack()
@@ -430,7 +436,6 @@ def handle_bim_slash_command(ack, body, client):
     client.views_open(trigger_id=trigger_id, view=modal_view)
 
 
-# 3. 홈 탭(App Home)의 빠른 실행 버튼 4종 처리
 @app.action("open_modal_search")
 def handle_open_modal_search(ack, body, client):
     ack()
@@ -457,7 +462,6 @@ def handle_refresh_sheet_cache(ack, body, client):
     publish_app_home(client, user_id)
 
 
-# 4. 모달 팝업창에서 [실행하기] 버튼을 눌렀을 때 데이터 추출 및 작업 실행
 @app.view("bim_assistant_modal_submit")
 def handle_modal_submission(ack, body, client, view):
     ack()
@@ -465,7 +469,6 @@ def handle_modal_submission(ack, body, client, view):
     state_values = view["state"]["values"]
 
     task_type = state_values["task_block"]["task_select"]["selected_option"]["value"]
-    
     cat_opt = state_values["category_block"]["category_select"].get("selected_option")
     target_category = cat_opt["value"] if cat_opt else "전체 분류"
 
@@ -476,7 +479,6 @@ def handle_modal_submission(ack, body, client, view):
 
     target_channel = state_values["channel_block"]["channel_select"].get("selected_conversation")
     if not target_channel:
-        # 채널을 지정하지 않은 경우(홈 탭에서 실행 등) 요청자와의 1:1 DM 채널을 자동으로 열어 전송
         dm_res = client.conversations_open(users=user_id)
         target_channel = dm_res["channel"]["id"]
 
@@ -491,7 +493,6 @@ def handle_modal_submission(ack, body, client, view):
     )
 
 
-# 5. 일반 채널 멘션(@봇이름) 및 1:1 DM 메시지 처리
 @app.event("app_mention")
 def handle_app_mention(event, say, client):
     process_bim_query(event, say, client)
@@ -506,10 +507,13 @@ def handle_direct_message(event, say, client):
 
 
 if __name__ == "__main__":
-    print("=================================================================")
-    print("=== [BIM 데이터 어시스턴트 - Slack 홈 탭 & /bim 모달 서버 가동] ===")
-    print("1. 슬랙 좌측 앱 목록에서 봇 클릭 -> [홈(Home)] 탭 대시보드 확인")
-    print("2. 어느 채팅방에서든 '/bim' 입력 -> 대화형 팝업창(Modal) 실행")
-    print("=================================================================")
+    print("=========================================================================")
+    print("=== [BIM 데이터 어시스턴트 v3.2 - Slack 챗봇 & 6시간 자동 동기화 통합 서버] ===")
+    print("1. 백그라운드 스레드에서 6시간 주기 구글 드라이브 자동 동기화가 함께 작동합니다.")
+    print("2. 이 창 1개만 켜두면 사내 슬랙 챗봇과 DB 최신화가 24시간 자동 유지됩니다.")
+    print("=========================================================================")
+    sync_thread = threading.Thread(target=background_auto_sync_loop, daemon=True)
+    sync_thread.start()
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()

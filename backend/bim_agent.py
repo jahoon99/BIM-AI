@@ -28,6 +28,18 @@ REVIT_PING_URL = REVIT_BASE_URL + "/ping"
 REVIT_EXEC_URL = REVIT_BASE_URL + "/execute"
 REVIT_INSPECT_URL = REVIT_BASE_URL + "/inspect"
 
+DEFAULT_9_CATEGORIES = [
+    "대외/발주처 BIM 지침",
+    "사내 표준/세팅기준",
+    "스펙북/자재기준",
+    "소프트웨어 가이드북",
+    "BIM 검토보고서",
+    "BIM 검토리스트",
+    "수량산출서",
+    "BIM 견적서",
+    "BIM 기술제안서/BEP"
+]
+
 # 2. 글로벌 인스턴스 초기화
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.8-flash",
@@ -94,8 +106,25 @@ def get_indexed_manual_list():
         return []
 
 
+def get_indexed_categories():
+    """9대 표준 카테고리를 기본 제공하며, 향후 사용자가 새 폴더를 추가해 적재된 신규 카테고리도 자동으로 병합해 반환합니다."""
+    col = get_collection()
+    db_cats = set()
+    if col:
+        try:
+            data = col.get(include=["metadatas"])
+            db_cats = {m.get("doc_category") for m in data.get("metadatas", []) if m and m.get("doc_category")}
+        except Exception:
+            pass
+    merged = list(DEFAULT_9_CATEGORIES)
+    for c in sorted(list(db_cats)):
+        if c not in merged:
+            merged.append(c)
+    return merged
+
+
 def get_vector_db_status():
-    """Vector DB 내부의 문서별 분류 현황 및 세팅 주제(setup_topic) 상세 데이터를 반환합니다."""
+    """Vector DB 내부의 문서별 분류 현황(폴더 경로 포함) 및 세팅 주제 상세 데이터를 반환합니다."""
     col = get_collection()
     if not col:
         return [], []
@@ -112,7 +141,9 @@ def get_vector_db_status():
             if not meta:
                 continue
             fname = meta.get("file_name", "미상")
+            dgroup = meta.get("domain_group", "미분류")
             cat = meta.get("doc_category", "미분류(구버전)")
+            fpath = meta.get("folder_path", "루트")
             ext = meta.get("file_ext", fname.rsplit('.', 1)[-1].lower() if '.' in fname else "")
             loc = meta.get("location", "")
             ctype = meta.get("chunk_type", "일반")
@@ -122,8 +153,10 @@ def get_vector_db_status():
 
             if fname not in doc_summary_map:
                 doc_summary_map[fname] = {
-                    "file_name": fname,
+                    "domain_group": dgroup,
                     "doc_category": cat,
+                    "folder_path": fpath,
+                    "file_name": fname,
                     "file_ext": ext,
                     "chunk_count": 0,
                     "total_chars": 0,
@@ -134,8 +167,9 @@ def get_vector_db_status():
 
             chunk_details.append({
                 "chunk_id": chunk_id,
-                "file_name": fname,
                 "doc_category": cat,
+                "folder_path": fpath,
+                "file_name": fname,
                 "location": loc,
                 "chunk_type": ctype,
                 "setup_topic": stopic,
@@ -175,7 +209,7 @@ def compute_hybrid_score(query, doc_text, meta, vector_dist):
             lexical_bonus += 0.025
 
     if meta.get("chunk_type") in {"양식및산출기준", "세팅기준데이터"}:
-        if any(k in query for k in ["양식", "수식", "산출", "어떻게", "기준", "매개변수", "파라미터"]):
+        if any(k in query for k in ["양식", "수식", "산출", "견적", "단가", "어떻게", "기준", "매개변수", "파라미터"]):
             lexical_bonus += 0.06
 
     return max(0.0, vector_dist - min(lexical_bonus, 0.25))
@@ -362,7 +396,7 @@ def search_bim_files(query):
 
 
 def get_ai_response(user_query, chat_history=None, return_context=False, target_manuals=None, target_category=None):
-    """다중 문서 비교, 수량산출 기준 파악 및 프로젝트 초기 세팅 도출에 최적화된 응답을 생성합니다."""
+    """다중 문서 비교, 수량산출/견적 기준 파악 및 프로젝트 초기 세팅 도출에 최적화된 응답을 생성합니다."""
     history_text = "이전 대화 없음"
     if chat_history:
         recent_msgs = chat_history[-6:]
@@ -389,13 +423,13 @@ def get_ai_response(user_query, chat_history=None, return_context=False, target_
         "[핵심 사실 및 제한 규칙]\n"
         "1. 두 저장소 모두에서 관련 정보를 전혀 찾을 수 없을 때만 '제공된 문서에서 찾을 수 없습니다.'라고 답변하세요.\n"
         "2. 제공된 데이터에 없는 내용을 추측하여 지어내지 마세요. 단, 문서에 명시된 사실들을 조합하여 실무 세팅 순서나 체크리스트로 재구성하는 것은 적극 수행하세요.\n\n"
-        "[다중 문서 비교, 수량산출서 양식 및 프로젝트 초기 세팅 도출 규칙]\n"
-        "1. 보고서 간 비교 / 가이드북 간 공통점·차이점 분석 요청 시:\n"
+        "[다중 문서 비교, 수량산출/견적서 양식 및 프로젝트 초기 세팅 도출 규칙]\n"
+        "1. 보고서/지침서/기술제안서 간 비교 및 가이드북 공통점·차이점 분석 요청 시:\n"
         "   - 비교 항목을 기준으로 마크다운 비교표(| 비교 기준 | 문서 A | 문서 B | 비고/출처 |)를 작성하고, 표 아래에 [공통점]과 [핵심 차이점]을 명확히 구분하여 요약하세요.\n"
-        "2. 수량산출서 양식 및 산출 방법(수식) 질문 시:\n"
-        "   - [양식및산출기준] 조각을 참조하여 표의 컬럼 구성, 적용된 엑셀 산출 수식(=C4*D4 등), 합계/비교 기준을 마크다운 표로 정리하세요.\n"
+        "2. 수량산출서 및 BIM 견적서 양식/산출 방법(수식·단가) 질문 시:\n"
+        "   - [양식및산출기준] 조각을 참조하여 표의 컬럼 구성, 적용된 엑셀 산출 수식(=C4*D4 등), 단가/합계/비교 기준을 마크다운 표로 정리하세요.\n"
         "3. 프로젝트 초기 세팅(매개변수, 뷰/필터 세팅, 템플릿 활용 등) 요청 시:\n"
-        "   - [매뉴얼/보고서/세팅기준 지식]과 [BIM 파일 목록]의 사내 표준 파일(템플릿 .rte, 공유 매개변수 .txt, 시트 도각 .rfa 등)을 연계하여 [실무 프로젝트 초기 세팅 단계별 가이드]를 제시하세요.\n"
+        "   - [매뉴얼/보고서/세팅기준 지식]과 [BIM 파일 목록]의 사내 표준 파일(템플릿 .rte, 공유 매개변수 .txt, 재료 .adsklib, 시트 도각 .rfa 등)을 연계하여 [실무 프로젝트 초기 세팅 단계별 가이드]를 제시하세요.\n"
         "4. 모든 인용 출처와 파일은 클릭 가능한 [원본 보기](링크) 또는 [다운로드](링크) 하이퍼링크를 포함하세요.\n\n"
         "[이전 대화 기록]\n{0}\n\n"
         "현재 사용자 질문: {1}\n\n"
