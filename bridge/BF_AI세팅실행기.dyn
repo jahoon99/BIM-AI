@@ -11,7 +11,7 @@
       "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
       "Name": "AI 스크립트 경로 (자동연결)",
       "Type": "string",
-      "Value": "G:\\다른 컴퓨터\\내 컴퓨터 (1)\\BIM AI\\BIM-AI\\bridge\\live_setup.py"
+      "Value": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py"
     }
   ],
   "Outputs": [
@@ -24,8 +24,8 @@
   "Nodes": [
     {
       "ConcreteType": "CoreNodeModels.Input.Filename, CoreNodeModels",
-      "HintPath": "G:\\다른 컴퓨터\\내 컴퓨터 (1)\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
-      "InputValue": "G:\\다른 컴퓨터\\내 컴퓨터 (1)\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
+      "HintPath": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
+      "InputValue": "C:\\Users\\wkgns\\Desktop\\스터디\\BIM AI\\BIM-AI\\bridge\\live_setup.py",
       "NodeType": "ExtensionNode",
       "Id": "a1b2c3d4e5f647898a1b2c3d4e5f6a7b",
       "Inputs": [],
