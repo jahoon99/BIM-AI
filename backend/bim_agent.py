@@ -10,7 +10,6 @@ import chromadb
 import gspread
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
-# 1. 환경변수 및 로컬 브릿지/통신 경로 설정
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -40,7 +39,6 @@ DEFAULT_9_CATEGORIES = [
     "BIM 기술제안서/BEP"
 ]
 
-# 2. 글로벌 인스턴스 초기화
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.8-flash",
     google_api_key=GOOGLE_API_KEY,
@@ -72,7 +70,6 @@ CACHE_TTL_SECONDS = 600
 
 
 def get_collection():
-    """ChromaDB 컬렉션 연결을 최신 상태로 반환합니다."""
     global collection
     try:
         collection = chroma_client.get_or_create_collection(
@@ -85,7 +82,6 @@ def get_collection():
 
 
 def get_cached_sheet_records(force_refresh=False):
-    """구글 시트 API 호출을 줄이기 위해 10분 주기로 메모리에 데이터를 캐싱합니다."""
     current_time = time.time()
     if force_refresh or _SHEET_CACHE["data"] is None or (current_time - _SHEET_CACHE["last_fetched"] > CACHE_TTL_SECONDS):
         _SHEET_CACHE["data"] = worksheet.get_all_records()
@@ -94,7 +90,6 @@ def get_cached_sheet_records(force_refresh=False):
 
 
 def get_indexed_manual_list():
-    """현재 ChromaDB에 학습되어 있는 전체 매뉴얼/보고서의 파일명 목록을 반환합니다."""
     col = get_collection()
     if not col:
         return []
@@ -107,7 +102,6 @@ def get_indexed_manual_list():
 
 
 def get_indexed_categories():
-    """9대 표준 카테고리를 기본 제공하며, 향후 사용자가 새 폴더를 추가해 적재된 신규 카테고리도 자동으로 병합해 반환합니다."""
     col = get_collection()
     db_cats = set()
     if col:
@@ -124,7 +118,6 @@ def get_indexed_categories():
 
 
 def get_vector_db_status():
-    """Vector DB 내부의 문서별 분류 현황(폴더 경로 포함) 및 세팅 주제 상세 데이터를 반환합니다."""
     col = get_collection()
     if not col:
         return [], []
@@ -190,7 +183,6 @@ def get_vector_db_status():
 
 
 def compute_hybrid_score(query, doc_text, meta, vector_dist):
-    """벡터 거리(Dense)와 키워드 정확 매칭(Sparse Lexical)을 결합하여 하이브리드 점수를 산출합니다 (낮을수록 우수)."""
     tokens = [t.lower() for t in re.findall(r'[a-zA-Z0-9가-힣]{2,}', query)]
     if not tokens:
         return vector_dist
@@ -215,13 +207,112 @@ def compute_hybrid_score(query, doc_text, meta, vector_dist):
     return max(0.0, vector_dist - min(lexical_bonus, 0.25))
 
 
+def lexical_fallback_search(col, query, top_k=8, effective_manuals=None, target_category=None):
+    """
+    [무중단 폴백 엔진] 구글 임베딩 API 일일 할당량(1,000건)이 소진되어 429 에러가 발생하더라도,
+    로컬 ChromaDB에 저장된 원문과 메타데이터를 직접 스캔하여 에러 없이 최적의 조각을 반환합니다.
+    """
+    try:
+        data = col.get(include=["documents", "metadatas"])
+        docs = data.get("documents", [])
+        metas = data.get("metadatas", [])
+    except Exception:
+        return "로컬 Vector DB 데이터를 불러올 수 없습니다."
+
+    if not docs:
+        return "현재 Vector DB에 적재된 문서가 없습니다."
+
+    raw_tokens = [t.lower() for t in re.findall(r'[a-zA-Z0-9가-힣]{2,}', query)]
+    expanded_kws = extract_keywords_with_llm(query)
+    all_tokens = list(dict.fromkeys(raw_tokens + expanded_kws))
+
+    def score_single_chunk(doc_txt, meta):
+        d_low = (doc_txt or "").lower()
+        f_low = str(meta.get("file_name", "")).lower()
+        t_low = str(meta.get("setup_topic", "")).lower()
+        c_low = str(meta.get("doc_category", "")).lower()
+        s = 0.0
+        for tok in all_tokens:
+            if len(tok) < 2:
+                continue
+            if tok in f_low:
+                s += 6.0
+            if tok in d_low:
+                s += 4.0 + min(d_low.count(tok), 4) * 0.8
+            if tok in t_low:
+                s += 3.0
+            if tok in c_low:
+                s += 2.5
+        if meta.get("chunk_type") in {"양식및산출기준", "세팅기준데이터"}:
+            s += 2.0
+        return s
+
+    context_list = []
+    if effective_manuals and len(effective_manuals) >= 1:
+        per_doc_k = max(3, top_k // len(effective_manuals))
+        chunk_counter = 1
+        for fname in effective_manuals:
+            doc_candidates = []
+            for doc_txt, meta in zip(docs, metas):
+                if not meta or meta.get("file_name") != fname:
+                    continue
+                if target_category and target_category != "전체 분류" and meta.get("doc_category") != target_category:
+                    continue
+                sc = score_single_chunk(doc_txt, meta)
+                doc_candidates.append((sc, doc_txt, meta))
+            doc_candidates.sort(key=lambda x: x[0], reverse=True)
+            for sc, doc_txt, meta in doc_candidates[:per_doc_k]:
+                cat = meta.get("doc_category", "미분류")
+                stopic = meta.get("setup_topic", "일반")
+                loc = meta.get("location", "")
+                link = meta.get("drive_link", "")
+                context_list.append(
+                    "--- [조각 #{0} (로컬 무중단 검색) | 문서: {1} ({2}) | 분류: {3} | 세팅주제: {4} | 매칭점수: {5:.1f}] ---\n내용: {6}\n원본 링크: {7}".format(
+                        chunk_counter, fname, loc, cat, stopic, sc, doc_txt, link
+                    )
+                )
+                chunk_counter += 1
+        return "\n\n".join(context_list) if context_list else "선택한 문서에서 관련 내용을 찾을 수 없습니다."
+
+    scored_all = []
+    for doc_txt, meta in zip(docs, metas):
+        if not meta:
+            continue
+        if target_category and target_category != "전체 분류" and meta.get("doc_category") != target_category:
+            continue
+        sc = score_single_chunk(doc_txt, meta)
+        scored_all.append((sc, doc_txt, meta))
+
+    scored_all.sort(key=lambda x: x[0], reverse=True)
+    doc_quota = {}
+    chunk_counter = 1
+    for sc, doc_txt, meta in scored_all:
+        fname = meta.get("file_name", "알 수 없는 파일")
+        if doc_quota.get(fname, 0) >= 3:
+            continue
+        doc_quota[fname] = doc_quota.get(fname, 0) + 1
+        cat = meta.get("doc_category", "미분류")
+        stopic = meta.get("setup_topic", "일반")
+        loc = meta.get("location", "")
+        link = meta.get("drive_link", "")
+        context_list.append(
+            "--- [조각 #{0} (로컬 무중단 검색) | 문서: {1} ({2}) | 분류: {3} | 세팅주제: {4} | 매칭점수: {5:.1f}] ---\n내용: {6}\n원본 링크: {7}".format(
+                chunk_counter, fname, loc, cat, stopic, sc, doc_txt, link
+            )
+        )
+        chunk_counter += 1
+        if len(context_list) >= top_k:
+            break
+
+    return "\n\n".join(context_list) if context_list else "관련 매뉴얼 내용을 찾을 수 없습니다."
+
+
 def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
-    """하이브리드 리랭킹(벡터 유사도 + 키워드 매칭) 및 다중 문서 균등 할당 검색을 수행합니다."""
+    """하이브리드 검색을 수행하며, 임베딩 API 할당량 초과(429) 시 로컬 무중단 검색으로 즉시 자동 전환합니다."""
     col = get_collection()
     if not col:
         return "학습된 매뉴얼 데이터가 없습니다."
 
-    query_vector = embeddings.embed_query(query)
     all_indexed_files = get_indexed_manual_list()
 
     auto_matched_files = []
@@ -235,6 +326,13 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
                     break
 
     effective_manuals = target_manuals if target_manuals else (auto_matched_files if len(auto_matched_files) >= 2 else None)
+
+    try:
+        query_vector = embeddings.embed_query(query)
+    except Exception:
+        # 임베딩 API 일일 할당량(1,000건) 소진 시 에러 대신 로컬 DB 직접 스캔 모드로 자동 전환
+        return lexical_fallback_search(col, query, top_k=top_k, effective_manuals=effective_manuals, target_category=target_category)
+
     context_list = []
 
     if effective_manuals and len(effective_manuals) >= 1:
@@ -324,7 +422,6 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
 
 
 def extract_keywords_with_llm(query):
-    """질문에서 핵심 대상 명사와 한/영 유의어를 추출합니다."""
     extraction_prompt = (
         "다음 사용자의 질문에서 BIM 파일 검색에 필요한 '핵심 대상 명사'만 추출하세요.\n"
         "'패밀리', '파일', '레빗', '찾아줘', '필요해' 같은 일반 명사나 서술어, 조사는 모두 제거하세요.\n"
@@ -347,7 +444,6 @@ def extract_keywords_with_llm(query):
 
 
 def search_bim_files(query):
-    """캐싱된 시트 데이터를 바탕으로 빠르게 BIM 파일을 검색합니다."""
     all_records = get_cached_sheet_records()
     if not all_records:
         return "구글 시트에 등록된 BIM 파일이 없습니다."
@@ -396,7 +492,6 @@ def search_bim_files(query):
 
 
 def get_ai_response(user_query, chat_history=None, return_context=False, target_manuals=None, target_category=None):
-    """다중 문서 비교, 수량산출/견적 기준 파악 및 프로젝트 초기 세팅 도출에 최적화된 응답을 생성합니다."""
     history_text = "이전 대화 없음"
     if chat_history:
         recent_msgs = chat_history[-6:]
@@ -447,7 +542,6 @@ def get_ai_response(user_query, chat_history=None, return_context=False, target_
 
 
 def generate_revit_shared_param_file(user_requirement, target_manuals=None):
-    """가이드라인 및 사내 공유 매개변수 지식을 바탕으로 Revit에서 즉시 로드 가능한 공유 매개변수(.txt) 파일을 생성합니다."""
     context = search_manuals("공유 매개변수 파라미터 속성 기준 {0}".format(user_requirement), top_k=8, target_manuals=target_manuals)
 
     prompt = (
@@ -496,7 +590,6 @@ def generate_revit_shared_param_file(user_requirement, target_manuals=None):
 
 
 def generate_dynamo_player_file():
-    """현재 PC의 브릿지 폴더 경로가 자동 연결된 Dynamo 플레이어 파일(.dyn)을 생성합니다."""
     runner_code = (
         "import os\nimport traceback\nimport clr\n"
         "clr.AddReference('RevitAPI')\nclr.AddReference('RevitAPIUI')\nclr.AddReference('RevitServices')\n"
@@ -555,7 +648,6 @@ def generate_dynamo_player_file():
 
 
 def install_pyrevit_extension():
-    """완전 무개입 Codex 제어(/execute) 및 실시간 모델 양방향 검수(/inspect)를 위한 pyRevit HTTP 수신기를 자동 설치합니다."""
     startup_lines = [
         "# -*- coding: utf-8 -*-",
         "from pyrevit import routes, HOST_APP",

@@ -2,6 +2,7 @@ import os
 import io
 import re
 import time
+import json
 import hashlib
 import tempfile
 import datetime
@@ -23,31 +24,29 @@ import openpyxl
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Font, PatternFill, Alignment
 
-# [핵심 설정] 검색 정밀도(Resolution) 보존을 위한 RAG 표준 청크 규격
 MIN_CHUNK_CHARS = 50
 OPTIMAL_CHUNK_SIZE = 1500
 OPTIMAL_CHUNK_OVERLAP = 200
 EXCEL_ROWS_PER_CHUNK = 25
 EMBED_BATCH_SIZE = 15
-SCHEMA_VERSION = "v3.5"
+SCHEMA_VERSION = "v3.6"
 
 BASE_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 DB_DOCS_DIR = os.path.join(BASE_DIR, "db_docs")
 MD_SPECS_DIR = os.path.join(DB_DOCS_DIR, "markdown_specs")
 EXCEL_REPORT_PATH = os.path.join(DB_DOCS_DIR, "VectorDB_통합관리대장.xlsx")
+LOCAL_CACHE_PATH = os.path.join(DB_DOCS_DIR, "local_text_cache.json")
 
 
 class DailyQuotaExhaustedError(Exception):
-    """구글 API 일일 무료 할당량(1,000건/일) 소진 시 현재까지 저장된 조각을 보존하고 안전 종료하기 위한 예외"""
+    """구글 API 일일 무료 할당량(1,000건/일) 소진 시 로컬 텍스트 캐시 모드로 전환하기 위한 예외"""
     pass
 
 
-# 분당 토큰(30,000 TPM) 및 분당 요청(100 RPM) 초과 예방용 슬라이딩 윈도우 기록기
 _RATE_WINDOW = []
 
 
 def match_category_keywords(target_str):
-    """폴더명 및 파일명에서 9대 표준 카테고리 키워드를 판별합니다."""
     t = target_str.lower()
     if any(k in t for k in ['뷰어', '가이드북', '매뉴얼', 'manual', 'guide', '다룩스', 'dalux', '트림블', 'trimble', 'acc', 'navisworks']):
         return "소프트웨어 가이드북"
@@ -71,7 +70,6 @@ def match_category_keywords(target_str):
 
 
 def classify_doc_category(file_name, ext, folder_path=""):
-    """1순위: 상위 폴더 경로 분석 -> 2순위: 파일명 분석 -> 3순위: 신규 폴더명 자동 채택."""
     folder_clean = folder_path.strip()
     if folder_clean and folder_clean not in {"루트폴더", "매뉴얼루트", "BIM파일루트"}:
         folder_matched = match_category_keywords(folder_clean)
@@ -124,7 +122,6 @@ def detect_setup_topic(text):
 
 
 def sanitize_for_excel(val):
-    """OpenPyXL 공식 ILLEGAL_CHARACTERS_RE 정규식을 사용하여 워크시트 비허용 제어문자를 100% 제거합니다."""
     if val is None:
         return ""
     if not isinstance(val, str):
@@ -140,13 +137,11 @@ def sanitize_for_excel(val):
 
 
 def clean_and_filter_text(text):
-    """데이터 손상 없이 순수 노이즈(비표준 제어문자, 목차 점선 기호, 과도한 공백)만 정제합니다."""
     if not text:
         return ""
     cleaned = text.replace('\x0b', '\n').replace('\x0c', '\n')
     cleaned = ILLEGAL_CHARACTERS_RE.sub(' ', cleaned)
     cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', ' ', cleaned)
-    # 목차 페이지의 연속 점선(..... 또는 ·····) 노이즈만 공백으로 축소 (실제 텍스트는 100% 보존)
     cleaned = re.sub(r'[\.·…]{5,}', ' ', cleaned)
     cleaned = re.sub(r'[ \t]+', ' ', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
@@ -172,10 +167,6 @@ def extract_shapes_text_recursively(shapes):
 
 
 def extract_documents_from_file(temp_path, ext, base_meta):
-    """
-    데이터 압축으로 인한 의미 희석(Dilution)을 방지하기 위해,
-    1,500자(오버랩 200자) 및 엑셀 25행 단위의 고정밀(High-Resolution) 무손실 청킹을 수행합니다.
-    """
     docs = []
     seen_hashes = set()
     text_splitter = RecursiveCharacterTextSplitter(
@@ -309,7 +300,6 @@ def extract_documents_from_file(temp_path, ext, base_meta):
             )
             add_valid_chunk(structure_summary, "{0} 시트 (양식/산출식 구조)".format(sheet), "양식및산출기준")
 
-            # [무손실 정밀 적재] 인위적인 시트당 조각 수 제한을 해제하고 25행 단위로 모든 행을 누락 없이 적재
             batch_rows_text, start_row_num = [], header_idx + 2
             for r_idx in range(header_idx + 1, len(rows_val)):
                 row_items = ["{0}: {1}".format(h, str(val).strip()) for h, val in zip(headers, rows_val[r_idx]) if val is not None and str(val).strip() != ""]
@@ -324,7 +314,6 @@ def extract_documents_from_file(temp_path, ext, base_meta):
                         )
                     batch_rows_text, start_row_num = [], r_idx + 2
 
-    # 각 조각 메타데이터에 해당 파일의 전체 목표 조각 수(total_chunks)를 기록하여 조각 단위 이어받기 기준점 생성
     total_cnt = len(docs)
     for idx, d in enumerate(docs):
         d.metadata["total_chunks"] = total_cnt
@@ -334,7 +323,6 @@ def extract_documents_from_file(temp_path, ext, base_meta):
 
 
 def throttle_before_request(batch_chars, batch_count):
-    """구글 무료 등급 분당 제한(30,000 토큰 & 100 요청/분)에 걸리지 않도록 사전 속도를 자동 조절합니다."""
     global _RATE_WINDOW
     now = time.time()
     _RATE_WINDOW = [(ts, c, cnt) for ts, c, cnt in _RATE_WINDOW if now - ts < 62.0]
@@ -353,13 +341,55 @@ def throttle_before_request(batch_chars, batch_count):
     _RATE_WINDOW.append((time.time(), batch_chars, batch_count))
 
 
-def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing_chunk_ids):
-    """
-    [핵심 개선: 배치 단위 즉시 저장(Incremental Commit) 및 조각 단위 이어받기(Chunk-level Resume)]
-    378조각짜리 대용량 문서를 임베딩하다가 중간에 일일 할당량(1,000건)이 소진되더라도,
-    직전 배치까지 성공한 조각들은 ChromaDB에 즉시 영구 저장되며 다음 실행 시 남은 조각부터 이어서 완료합니다.
-    """
+def save_chunks_to_local_cache(file_id, docs, existing_chunk_ids):
+    """일일 임베딩 할당량이 소진된 경우에도 드라이브의 모든 문서를 즉시 선택·검색할 수 있도록 로컬 텍스트 캐시에 저장합니다."""
+    os.makedirs(DB_DOCS_DIR, exist_ok=True)
+    cache_data = []
+    if os.path.exists(LOCAL_CACHE_PATH):
+        try:
+            with open(LOCAL_CACHE_PATH, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+        except Exception:
+            cache_data = []
+
+    cache_map = {item["id"]: item for item in cache_data if isinstance(item, dict) and "id" in item}
+    added = 0
+    for i, doc in enumerate(docs):
+        cid = "{0}_chunk_{1}".format(file_id, i)
+        if cid not in existing_chunk_ids:
+            cache_map[cid] = {
+                "id": cid,
+                "document": doc.page_content,
+                "metadata": doc.metadata
+            }
+            added += 1
+
+    with open(LOCAL_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(list(cache_map.values()), f, ensure_ascii=False, indent=2)
+    return added
+
+
+def remove_embedded_from_local_cache(embedded_ids):
+    """임베딩이 완료된 조각은 로컬 대기 캐시에서 제거합니다."""
+    if not os.path.exists(LOCAL_CACHE_PATH) or not embedded_ids:
+        return
+    try:
+        with open(LOCAL_CACHE_PATH, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+        remained = [item for item in cache_data if item.get("id") not in embedded_ids]
+        with open(LOCAL_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(remained, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing_chunk_ids, quota_exhausted=False):
     total = len(docs)
+    if quota_exhausted:
+        added = save_chunks_to_local_cache(file_id, docs, existing_chunk_ids)
+        print("   -> [무할당량 로컬 텍스트 인덱싱] 총 {0}개 조각을 로컬 검색 캐시에 즉시 등록했습니다 (슬랙/웹에서 바로 선택·검색 가능).".format(added))
+        return False
+
     pending_items = []
     for i, doc in enumerate(docs):
         cid = "{0}_chunk_{1}".format(file_id, i)
@@ -368,7 +398,7 @@ def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing
 
     if not pending_items:
         print("   -> 모든 조각({0}개)이 이미 DB에 존재합니다.".format(total))
-        return True
+        return False
 
     already_done = total - len(pending_items)
     if already_done > 0:
@@ -390,13 +420,13 @@ def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing
         while True:
             try:
                 vectors = embeddings.embed_documents(batch_texts)
-                # 임베딩 성공 즉시 배치 단위로 ChromaDB에 영구 저장 (중간에 멈춰도 절대 증발하지 않음)
                 collection.upsert(
                     ids=batch_ids,
                     embeddings=vectors,
                     documents=batch_texts,
                     metadatas=batch_metas
                 )
+                remove_embedded_from_local_cache(set(batch_ids))
                 done_so_far = already_done + min(idx + EMBED_BATCH_SIZE, len(pending_items))
                 print("     ... 실시간 DB 저장 진행률: {0} / {1} 조각 완료".format(done_so_far, total))
                 if idx + EMBED_BATCH_SIZE < len(pending_items):
@@ -404,14 +434,15 @@ def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing
                 break
             except Exception as e:
                 err_msg = str(e)
-                # 1. 일일 무료 할당량(1,000건/일) 도달 시 -> 방금 전 배치까지 저장된 조각들을 남기고 즉시 안전 종료
                 if "PerDay" in err_msg or "per day" in err_msg.lower() or "limit: 1000" in err_msg:
                     saved_cnt = already_done + idx
-                    print("\n   -> [일일 무료 할당량(1,000건/일) 도달] 현재 파일의 {0}/{1} 조각까지 안전하게 DB에 저장했습니다.".format(saved_cnt, total))
-                    print("   -> 남은 조각과 미완료 파일은 다음 동기화(또는 할당량 리셋 후) 시 자동으로 이어서 진행됩니다.")
-                    raise DailyQuotaExhaustedError(err_msg)
+                    already_embedded_now = existing_chunk_ids | {item[0] for item in pending_items[:idx]}
+                    cached_cnt = save_chunks_to_local_cache(file_id, docs, already_embedded_now)
+                    print("\n   -> [일일 무료 할당량(1,000건/일) 도달] {0}/{1} 조각은 Vector DB에, 남은 {2}개 조각은 로컬 검색 캐시에 저장했습니다.".format(
+                        saved_cnt, total, cached_cnt
+                    ))
+                    return True
 
-                # 2. 분당 토큰/요청(30,000 TPM / 100 RPM) 제한 시 -> 구글이 안내한 retryDelay 초만큼 대기 후 100% 재개
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     retry_count += 1
                     if retry_count > max_retries:
@@ -428,7 +459,7 @@ def embed_and_save_incrementally(collection, embeddings, file_id, docs, existing
                 else:
                     raise e
 
-    return True
+    return False
 
 
 def get_all_files_recursively(drive_service, folder_id, root_label="루트폴더"):
@@ -479,17 +510,17 @@ def filter_duplicate_pdf_files(drive_files):
 
 
 def export_vector_db_documentation(collection, key_path, sheet_id):
-    """DB 내 잘못된 분류와 제어문자를 먼저 자동 교정한 뒤 3중 문서를 생성합니다."""
+    """ChromaDB 적재 데이터와 로컬 텍스트 캐시 데이터를 통합하여 3중 문서화(Sheets + Excel + 1:1 MD)를 생성합니다."""
     print("\n=== [Step 1-C: Vector DB 자동 교정 및 3중 문서화(Sheets + Excel + 1:1 MD) 시작] ===")
     os.makedirs(DB_DOCS_DIR, exist_ok=True)
     os.makedirs(MD_SPECS_DIR, exist_ok=True)
 
     data = collection.get(include=["documents", "metadatas"])
-    ids = data.get("ids", [])
-    docs = data.get("documents", [])
-    metas = data.get("metadatas", [])
+    ids = list(data.get("ids", []))
+    docs = list(data.get("documents", []))
+    metas = list(data.get("metadatas", []))
 
-    fix_ids, fix_docs, fix_metas = [], [], []
+    fix_ids, fix_metas = [], []
     for i, (cid, content, meta) in enumerate(zip(ids, docs, metas)):
         if not meta:
             continue
@@ -504,20 +535,37 @@ def export_vector_db_documentation(collection, key_path, sheet_id):
             r'[문서명: \1 | 분류: {0} | 폴더경로: {1} |'.format(correct_cat, fpath),
             cleaned_txt
         )
-        if meta.get("doc_category") != correct_cat or meta.get("domain_group") != correct_dom or cleaned_txt != content:
-            meta["doc_category"] = correct_cat
-            meta["domain_group"] = correct_dom
-            meta["char_length"] = len(cleaned_txt)
-            meta["schema_version"] = SCHEMA_VERSION
-            docs[i] = cleaned_txt
-            metas[i] = meta
+        docs[i] = cleaned_txt
+
+        if meta.get("doc_category") != correct_cat or meta.get("domain_group") != correct_dom:
+            new_m = meta.copy()
+            new_m["doc_category"] = correct_cat
+            new_m["domain_group"] = correct_dom
+            new_m["char_length"] = len(cleaned_txt)
+            new_m["schema_version"] = SCHEMA_VERSION
+            metas[i] = new_m
             fix_ids.append(cid)
-            fix_docs.append(cleaned_txt)
-            fix_metas.append(meta)
+            fix_metas.append(new_m)
 
     if fix_ids:
-        collection.update(ids=fix_ids, documents=fix_docs, metadatas=fix_metas)
-        print(" -> [DB 자동 교정 완료] 총 {0}개 조각의 카테고리 분류 및 제어문자를 즉시 보정했습니다.".format(len(fix_ids)))
+        collection.update(ids=fix_ids, metadatas=fix_metas)
+        print(" -> [DB 메타데이터 교정 완료] 총 {0}개 조각의 카테고리 분류를 즉시 보정했습니다.".format(len(fix_ids)))
+
+    # 로컬 텍스트 캐시(임베딩 대기 문서)도 문서화 및 검색 대장에 통합
+    seen_id_set = set(ids)
+    if os.path.exists(LOCAL_CACHE_PATH):
+        try:
+            with open(LOCAL_CACHE_PATH, "r", encoding="utf-8") as f:
+                cached_list = json.load(f)
+            for item in cached_list:
+                cid = item.get("id")
+                if cid and cid not in seen_id_set and item.get("metadata"):
+                    seen_id_set.add(cid)
+                    ids.append(cid)
+                    docs.append(item.get("document", ""))
+                    metas.append(item.get("metadata", {}))
+        except Exception:
+            pass
 
     doc_groups, all_chunks_rows = {}, []
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -655,7 +703,7 @@ def export_vector_db_documentation(collection, key_path, sheet_id):
 
 
 def ingest_manuals_to_chroma(force_rebuild=False):
-    print("=== [Step 1-B: Vector DB v3.5 (데이터 무손실 정밀 청킹 + 조각 단위 이어받기) 시작] ===\n")
+    print("=== [Step 1-B: Vector DB v3.6 (무손실 정밀 청킹 + 할당량 초과 시 로컬 캐시 전수 인덱싱) 시작] ===\n")
     load_dotenv()
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     manual_folder_id = os.getenv("MANUAL_FOLDER_ID")
@@ -675,7 +723,6 @@ def ingest_manuals_to_chroma(force_rebuild=False):
     collection = chroma_client.get_or_create_collection(name="bim_manuals", metadata={"hnsw:space": "cosine"})
     existing_data = collection.get(include=["metadatas"])
 
-    # 파일별 저장 상태 및 조각 ID 목록 추적 (완료 파일 vs 부분 저장 파일 구분)
     existing_files = {}
     for cid, meta in zip(existing_data.get("ids", []), existing_data.get("metadatas", [])):
         if meta and "file_id" in meta:
@@ -690,7 +737,7 @@ def ingest_manuals_to_chroma(force_rebuild=False):
             if meta.get("total_chunks", 0) > existing_files[fid]["total_chunks"]:
                 existing_files[fid]["total_chunks"] = meta.get("total_chunks", 0)
 
-    print("1. 현재 Vector DB에 적재된 문서(부분 적재 포함) 수: {0}개".format(len(existing_files)))
+    print("1. 현재 Vector DB에 적재된 문서 수: {0}개".format(len(existing_files)))
 
     creds = Credentials.from_service_account_file(key_path, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     drive_service = build('drive', 'v3', credentials=creds)
@@ -707,6 +754,7 @@ def ingest_manuals_to_chroma(force_rebuild=False):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=gemini_api_key)
     supported_extensions = {'pdf', 'docx', 'pptx', 'xlsx', 'txt'}
     completed_count = 0
+    quota_exhausted = False
 
     for file in drive_files:
         file_id, file_name = file.get('id'), file.get('name', '')
@@ -733,7 +781,6 @@ def ingest_manuals_to_chroma(force_rebuild=False):
 
         if prev_state:
             if prev_state["mod_time"] == drive_mod_time:
-                # 1) 이전 버전(v3.2/v3.3)에서 이미 전체 적재 완료된 파일(total_chunks 기록이 없거나 모든 조각이 다 들어간 경우)은 그대로 보존
                 expected_cnt = prev_state["total_chunks"]
                 actual_cnt = len(prev_state["chunk_ids"])
                 if expected_cnt == 0 or actual_cnt >= expected_cnt:
@@ -742,13 +789,11 @@ def ingest_manuals_to_chroma(force_rebuild=False):
                     ))
                     continue
                 else:
-                    # 2) 직전 실행 중 일일 한도로 인해 일부 조각만 저장된 파일은 기존 조각을 보존하고 이어받기 수행
                     existing_cids = prev_state["chunk_ids"]
             else:
-                # 3) 구글 드라이브에서 파일 내용이 수정된 경우 기존 조각 삭제 후 재적재
                 collection.delete(where={"file_id": file_id})
 
-        print(" - [정밀 적재/이어받기] [{0} | {1}] '{2}' (경로: {3}) 추출 중...".format(domain_group, doc_category, file_name, folder_path))
+        print(" - [정밀 적재/인덱싱] [{0} | {1}] '{2}' (경로: {3}) 추출 중...".format(domain_group, doc_category, file_name, folder_path))
         temp_path = None
         try:
             request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime) if export_mime else drive_service.files().get_media(fileId=file_id)
@@ -768,12 +813,12 @@ def ingest_manuals_to_chroma(force_rebuild=False):
             }
             docs = extract_documents_from_file(temp_path, ext, base_meta)
             if docs:
-                print("   -> 무손실 정밀 분할 완료: 총 {0}개 조각 (15개 배치 단위 실시간 저장 시작...)".format(len(docs)))
-                embed_and_save_incrementally(collection, embeddings, file_id, docs, existing_cids)
+                hit_daily_limit = embed_and_save_incrementally(
+                    collection, embeddings, file_id, docs, existing_cids, quota_exhausted=quota_exhausted
+                )
+                if hit_daily_limit:
+                    quota_exhausted = True
                 completed_count += 1
-                print("   -> 완료: '{0}' Vector DB 전수 적재 성공\n".format(file_name))
-        except DailyQuotaExhaustedError:
-            break
         except Exception as e:
             print("   -> [오류 발생] '{0}' 처리 실패: {1}\n".format(file_name, e))
         finally:
@@ -781,7 +826,7 @@ def ingest_manuals_to_chroma(force_rebuild=False):
                 os.remove(temp_path)
 
     export_vector_db_documentation(collection, key_path, sheet_id)
-    print("=== [Vector DB 동기화 및 3중 문서화 종료 (이번 실행 완료 파일: {0}개)] ===".format(completed_count))
+    print("=== [Vector DB 동기화 및 전수 인덱싱 종료 (이번 처리 파일: {0}개)] ===".format(completed_count))
 
 
 if __name__ == "__main__":
