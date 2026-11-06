@@ -428,6 +428,7 @@ def handle_app_home_opened(client, event):
 
 
 @app.command("/bim")
+@app.command("/bf")
 def handle_bim_slash_command(ack, body, client):
     ack()
     trigger_id = body.get("trigger_id")
