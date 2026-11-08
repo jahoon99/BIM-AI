@@ -619,11 +619,27 @@ def fetch_thread_history(client, channel_id, thread_ts, current_ts):
 
 
 def infer_auto_task_type(query_text):
-    q_low = (query_text or "").lower()
-    if any(k in q_low for k in ["!매개변수", "매개변수 파일", "공유 매개변수 생성", "공유매개변수 파일", "파라미터 파일", ".txt 만들어", "txt 파일 만들어"]):
+    """
+    [정밀 의도 분기 패치]
+    단순히 '공유 매개변수 파일 목록/링크 알려줘'라고 검색할 때는 통합 검색(search)으로 유지하고,
+    명시적인 '!매개변수' 명령어 또는 '생성/만들어/추가해' 요구가 결합된 경우에만 파일 생성으로 분기합니다.
+    """
+    q_low = (query_text or "").strip().lower()
+    if q_low.startswith("!매개변수"):
         return "param"
-    if any(k in q_low for k in ["!세팅코드", "세팅 코드", "세팅 스크립트", "파이썬 코드", "파이썬 스크립트", ".py 만들어", "자동 세팅 코드"]):
+    if q_low.startswith("!세팅코드"):
         return "script"
+
+    # 단순 목록/링크 탐색 질문이면 무조건 통합 검색(search)으로 유지
+    is_search_intent = any(w in q_low for w in ["목록", "링크", "찾아줘", "알려줘", "어떤", "무엇", "비교해줘", "설명해줘"])
+    has_gen_intent = any(w in q_low for w in ["생성", "만들어", "짜줘", "작성해", "추가해서 파일"])
+
+    if has_gen_intent and not is_search_intent:
+        if any(k in q_low for k in ["매개변수", "파라미터", ".txt"]):
+            return "param"
+        if any(k in q_low for k in ["세팅 코드", "세팅 스크립트", "파이썬 코드", "파이썬 스크립트", ".py"]):
+            return "script"
+
     return "search"
 
 
@@ -888,7 +904,8 @@ def execute_task_and_post(client, channel_id, user_id, task_type, query_text, ta
             client.chat_delete(channel=channel_id, ts=temp_msg["ts"])
             append_qa_log_to_sheet(
                 client, channel_id, user_id, "Revit 세팅 코드(.py) 생성", target_category,
-                manuals_str, query_text, full_desc,
+                manuals_str, query_text,
+                "■ 1. 한 줄 핵심 결론\nRevit 세팅 코드(.py) 생성 완료: {0}\n\n{1}".format(query_text[:60], full_desc),
                 md_download_url=dl_url, md_permalink=perma_url,
                 fallback_user_name=fallback_user_name, fallback_channel_name=fallback_channel_name
             )
