@@ -407,10 +407,16 @@ def run_startup_self_diagnosis():
 
 
 def background_auto_sync_loop():
+    """
+    [무개입 자동 이어받기 스케줄러]
+    서버 실행 60초 후(슬랙 초기 연결 및 팝업 캐싱 완료 직후) 미동기화 파일을 자동으로 추려 1차 이어받기를 수행하고,
+    이후 6시간 주기로 계속 자동 점검합니다.
+    """
+    # 부팅 직후 60초 동안은 슬랙 명령어 응답 속도를 100% 보장하기 위해 대기
+    time.sleep(60)
     while True:
-        time.sleep(SYNC_INTERVAL_SECONDS)
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print("\n[자동 동기화 스케줄러 | {0}] 구글 드라이브 변경사항 및 미완료 조각 점검 시작...".format(now_str))
+        print("\n[자동 동기화 스케줄러 | {0}] 미동기화 파일 및 남은 조각 자동 이어받기 점검 시작...".format(now_str))
         try:
             sync_drive_to_sheets()
             get_cached_sheet_records(force_refresh=True)
@@ -419,6 +425,7 @@ def background_auto_sync_loop():
             traceback.print_exc()
 
         try:
+            # force_rebuild=False 이므로 이미 완료된 문서는 0.1초 만에 건너뛰고 미비된 문서만 자동 적재함
             ingest_manuals_to_chroma(force_rebuild=False)
             refresh_modal_meta_cache()
         except Exception as e:
@@ -426,7 +433,8 @@ def background_auto_sync_loop():
             traceback.print_exc()
 
         next_time = (datetime.datetime.now() + datetime.timedelta(seconds=SYNC_INTERVAL_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
-        print("[자동 동기화 완료] 다음 정기 동기화 시각: {0}\n".format(next_time))
+        print("[자동 동기화 완료] 오늘치 할당량 내 적재 완료. 다음 자동 이어받기 시각: {0}\n".format(next_time))
+        time.sleep(SYNC_INTERVAL_SECONDS)
 
 
 def render_table_as_slack_cards(table_lines):
