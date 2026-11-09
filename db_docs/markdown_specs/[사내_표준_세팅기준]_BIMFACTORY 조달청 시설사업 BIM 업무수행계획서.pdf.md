@@ -1,4 +1,4 @@
-﻿# Vector DB 1:1 데이터 명세서: BIMFACTORY 조달청 시설사업 BIM 업무수행계획서.pdf
+# Vector DB 1:1 데이터 명세서: BIMFACTORY 조달청 시설사업 BIM 업무수행계획서.pdf
 
 ## 1. 문서 분류 및 메타데이터 요약
 - **상위 도메인:** `1_표준및기준`
