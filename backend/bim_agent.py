@@ -15,12 +15,13 @@ from googleapiclient.http import MediaIoBaseDownload
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-SHEET_ID = os.getenv("SPREADSHEET_ID")
-CHROMA_PATH = os.getenv("CHROMA_DB_PATH")
-
 BASE_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+SHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "").strip() or os.path.join(BASE_DIR, "chroma_db")
+
 BRIDGE_DIR = os.path.join(BASE_DIR, "bridge")
 os.makedirs(BRIDGE_DIR, exist_ok=True)
 LIVE_SCRIPT_PATH = os.path.join(BRIDGE_DIR, "live_setup.py")
@@ -94,15 +95,37 @@ try:
 except Exception:
     collection = None
 
-gc = gspread.service_account(filename=CRED_PATH)
-sh = gc.open_by_key(SHEET_ID)
-worksheet = sh.get_worksheet(0)
+# [무중단 지연 연결] 구글 서비스 계정(.json) 오류 시에도 슬랙 봇 및 로컬 Vector DB 검색이 죽지 않도록 방어
+gc = None
+sh = None
+worksheet = None
 
 _SHEET_CACHE = {
     "data": None,
     "last_fetched": 0
 }
 CACHE_TTL_SECONDS = 600
+
+
+def get_worksheet_safe():
+    """구글 시트 연결을 지연 초기화하며, 인증키 오류(invalid_grant 등) 발생 시 프로그램 종료 대신 경고만 출력합니다."""
+    global gc, sh, worksheet
+    if worksheet is not None:
+        return worksheet
+    try:
+        if not CRED_PATH or not os.path.exists(CRED_PATH):
+            print("[시트 연결 경고] 인증키 파일을 찾을 수 없습니다:", CRED_PATH)
+            return None
+        if not SHEET_ID:
+            print("[시트 연결 경고] SPREADSHEET_ID가 설정되지 않았습니다.")
+            return None
+        gc = gspread.service_account(filename=CRED_PATH)
+        sh = gc.open_by_key(SHEET_ID)
+        worksheet = sh.get_worksheet(0)
+        return worksheet
+    except Exception as e:
+        print("[시트 인증 경고] 구글 서비스 계정 키가 만료되었거나 정지되었습니다 (.json 키 확인 필요):", e)
+        return None
 
 
 def get_collection():
@@ -143,6 +166,7 @@ def extract_keywords_fast_local(query):
 
 
 def build_direct_download_url(view_url):
+    """구글 드라이브 웹 뷰어 링크(webViewLink)로부터 즉시 다운로드 직링크를 생성합니다."""
     if not view_url:
         return ""
     u = str(view_url).strip()
@@ -164,6 +188,7 @@ def build_direct_download_url(view_url):
 
 
 def format_dual_links_in_answer(md_text):
+    """AI 답변 내의 모든 구글 드라이브 마크다운 링크를 '파일명 : [즉시 다운로드] | [웹 미리보기]'로 자동 변환합니다."""
     if not md_text:
         return ""
 
@@ -184,7 +209,8 @@ def format_dual_links_in_answer(md_text):
 
 
 def download_referenced_excel_files(ai_answer_text, max_files=2):
-    if not ai_answer_text or not CRED_PATH:
+    """답변에 인용된 엑셀(.xlsx) 원본 파일을 구글 드라이브에서 직접 내려받아 반환합니다."""
+    if not ai_answer_text or not CRED_PATH or not os.path.exists(CRED_PATH):
         return []
 
     urls = re.findall(r'https?://(?:drive|docs)\.google\.com/[^\s\)\>]+', ai_answer_text)
@@ -253,8 +279,18 @@ def download_referenced_excel_files(ai_answer_text, max_files=2):
 def get_cached_sheet_records(force_refresh=False):
     current_time = time.time()
     if force_refresh or _SHEET_CACHE["data"] is None or (current_time - _SHEET_CACHE["last_fetched"] > CACHE_TTL_SECONDS):
-        _SHEET_CACHE["data"] = worksheet.get_all_records()
-        _SHEET_CACHE["last_fetched"] = current_time
+        ws = get_worksheet_safe()
+        if ws is not None:
+            try:
+                _SHEET_CACHE["data"] = ws.get_all_records()
+                _SHEET_CACHE["last_fetched"] = current_time
+            except Exception as e:
+                print("[시트 데이터 조회 경고] 시트 레코드를 읽는 중 오류가 발생했습니다:", e)
+                if _SHEET_CACHE["data"] is None:
+                    _SHEET_CACHE["data"] = []
+        else:
+            if _SHEET_CACHE["data"] is None:
+                _SHEET_CACHE["data"] = []
     return _SHEET_CACHE["data"]
 
 
@@ -496,7 +532,6 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
 
     effective_manuals = target_manuals if target_manuals else (auto_matched_files if len(auto_matched_files) >= 2 else None)
 
-    # [서킷 브레이커 작동] 이미 임베딩 할당량이 소진된 상태라면 1.5초 걸리는 실패 호출을 건너뛰고 0.001초 만에 로컬 검색 실행
     if time.time() < _EMBED_QUOTA_COOLDOWN_UNTIL:
         return lexical_fallback_search(col, query, top_k=top_k, effective_manuals=effective_manuals, target_category=target_category)
 
@@ -601,7 +636,7 @@ def search_manuals(query, top_k=8, target_manuals=None, target_category=None):
 def search_bim_files(query):
     all_records = get_cached_sheet_records()
     if not all_records:
-        return "구글 시트에 등록된 BIM 파일이 없습니다."
+        return "구글 시트에 등록된 BIM 파일이 없거나 시트 연결이 비활성 상태입니다."
 
     if len(all_records) <= 100:
         result_list = ["[전체 BIM 파일 목록 직접 스캔 모드 (총 {0}개)]".format(len(all_records))]

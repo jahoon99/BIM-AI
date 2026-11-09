@@ -47,6 +47,10 @@ Thumbs.db
 # Security (사내 프로젝트 필수 보안 파일: API 키, DB 접속 정보 등)
 .env
 .env.portable
+*.json
+chroma_db/
+venv/
+__pycache__/
 
 # Google Cloud Service Account Key (보안 인증 파일)
 *.json
