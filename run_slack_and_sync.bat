@@ -1,25 +1,11 @@
 @echo off
 chcp 65001 > nul
-title BIM AI - 슬랙 챗봇 및 자동 동기화 서버 (완전 포터블 모드)
-
 cd /d "%~dp0"
-
-set PY_CMD=python
-if exist "venv\Scripts\python.exe" (
-    "venv\Scripts\python.exe" -c "import sys" > nul 2>&1
-    if not errorlevel 1 (
-        set PY_CMD="venv\Scripts\python.exe"
-    )
-)
-
-%PY_CMD% -c "import dotenv, chromadb, gspread, slack_bolt" > nul 2>&1
-if errorlevel 1 (
-    echo [환경 자동 구성] 현재 PC에 필요한 파이썬 패키지를 자동으로 설치합니다...
-    %PY_CMD% -m pip install python-dotenv streamlit langchain-google-genai langchain-core langchain-text-splitters chromadb gspread google-api-python-client google-auth pypdf python-docx python-pptx openpyxl slack-bolt
-)
-
-REM 현재 PC 폴더 경로에 맞춰 .env 내의 인증키 및 DB 경로를 0.1초 만에 자동 보정
-%PY_CMD% auto_portable_env.py
-
-%PY_CMD% -u slack_bot.py
+echo ==================================================================
+echo [비아이엠팩토리 AI 업무 지원 시스템] BF 파일 분석 및 슬랙 봇 가동
+echo ==================================================================
+python data_pipeline/hybrid_server_sync.py
+echo.
+echo [슬랙 AI 어시스턴트 실시간 수신 대기 시작...]
+python slack_bot.py
 pause

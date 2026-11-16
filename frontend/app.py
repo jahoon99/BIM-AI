@@ -1,497 +1,841 @@
-import streamlit as st
-import sys
-import os
+﻿import os
 import io
-import json
-from contextlib import redirect_stdout
-from dotenv import load_dotenv
+import re
+import sys
+import zipfile
+import base64
+from collections import defaultdict
+import streamlit as st
 
-sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
-load_dotenv()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1234")
-GOOGLE_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-SHEET_ID = os.getenv("SPREADSHEET_ID")
+BASE_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+STREAMLIT_CONFIG_DIR = os.path.join(BASE_DIR, ".streamlit")
+STREAMLIT_CONFIG_PATH = os.path.join(STREAMLIT_CONFIG_DIR, "config.toml")
+try:
+    os.makedirs(STREAMLIT_CONFIG_DIR, exist_ok=True)
+    with open(STREAMLIT_CONFIG_PATH, "w", encoding="utf-8") as cf:
+        cf.write(
+            '[theme]\n'
+            'base="light"\n'
+            'primaryColor="#0F172A"\n'
+            'backgroundColor="#F8FAFC"\n'
+            'secondaryBackgroundColor="#FFFFFF"\n'
+            'textColor="#0F172A"\n'
+            'font="sans serif"\n'
+        )
+except Exception:
+    pass
 
 from backend.bim_agent import (
-    get_collection,
     get_ai_response,
     get_cached_sheet_records,
     get_indexed_manual_list,
-    get_indexed_categories,
-    get_vector_db_status,
+    find_referenced_server_file_paths,
     generate_revit_shared_param_file,
-    generate_revit_setup_script,
-    generate_dynamo_player_file,
-    install_pyrevit_extension,
-    check_revit_connection,
-    execute_in_revit_with_self_healing,
-    run_live_model_qa
+    generate_revit_setup_script
 )
-from data_pipeline.sync_bim_metadata import sync_drive_to_sheets
-from data_pipeline.ingest_manuals import (
-    ingest_manuals_to_chroma,
-    export_vector_db_documentation,
-    EXCEL_REPORT_PATH,
-    MD_SPECS_DIR
+from data_pipeline.hybrid_server_sync import (
+    SERVER_STORAGE_PATH,
+    TAXONOMY_USAGE,
+    TAXONOMY_METHOD,
+    TAXONOMY_DISCIPLINE,
+    TAXONOMY_TASK,
+    scan_hybrid_server_and_update,
+    load_showcase_catalog,
+    load_showcase_slides
 )
 
-st.set_page_config(page_title="BIM 데이터 어시스턴트", layout="wide")
+TAB1_TITLE = "산출물 아카이브"
+TAB2_TITLE = "AI 지식 어시스턴트"
+TAB3_TITLE = "Revit 자동 세팅"
 
-# --- [좌측 사이드바: 일반 제어 및 관리자 모드 인증] ---
-with st.sidebar:
-    st.header("시스템 메뉴")
-    if st.button("대화 내용 초기화", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
+st.set_page_config(
+    page_title="비아이엠팩토리 사내 통합 자료 기반 AI 업무 지원 시스템",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-    st.divider()
-    st.subheader("관리자 모드 전환")
-    admin_input = st.text_input("관리자 비밀번호 입력", type="password", placeholder="비밀번호 입력 시 관리 탭 활성화")
-    is_admin = (admin_input == ADMIN_PASSWORD)
+st.markdown("""
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
 
-    if is_admin:
-        st.success("관리자 모드 활성화됨 (상단 관리 탭 3종 잠금 해제)")
+html, body, [class*="css"], .stApp {
+    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif !important;
+    background-color: #F8FAFC !important;
+    color: #0F172A !important;
+}
 
-        st.markdown("**1. BIM 파일 목록 동기화 (Sheets)**")
-        if st.button("BIM 파일 동기화 실행", use_container_width=True):
-            with st.spinner("구글 드라이브 스캔 및 AI 메타데이터 생성 중..."):
-                log_buffer = io.StringIO()
-                try:
-                    with redirect_stdout(log_buffer):
-                        sync_drive_to_sheets()
-                    get_cached_sheet_records(force_refresh=True)
-                    st.success("BIM 파일 동기화 및 캐시 갱신 완료")
-                except Exception as e:
-                    st.error("동기화 중 오류 발생: {0}".format(e))
-                with st.expander("실행 상세 로그 보기", expanded=True):
-                    st.code(log_buffer.getvalue(), language="text")
+.block-container {
+    padding-top: 2.2rem !important;
+    padding-bottom: 3rem !important;
+    max-width: 1440px !important;
+}
 
-        st.markdown("**2. 매뉴얼/문서 지식 DB 동기화**")
-        force_rebuild = st.checkbox("기존 Vector DB 초기화 후 v3.2 규격으로 전체 재구축")
-        if st.button("매뉴얼 Vector DB 동기화 (+자동 문서화)", use_container_width=True):
-            with st.spinner("9대 표준 분류 태깅, 임베딩 및 3중 관리 문서(Sheets/Excel/MD) 생성 중..."):
-                log_buffer = io.StringIO()
-                try:
-                    with redirect_stdout(log_buffer):
-                        ingest_manuals_to_chroma(force_rebuild=force_rebuild)
-                    st.success("Vector DB 동기화 및 3중 문서화 완료")
-                except Exception as e:
-                    st.error("벡터 DB 동기화 중 오류 발생: {0}".format(e))
-                with st.expander("실행 상세 로그 보기", expanded=True):
-                    st.code(log_buffer.getvalue(), language="text")
+.modern-header {
+    background-color: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 24px 30px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+}
+.modern-badge {
+    display: inline-block;
+    background-color: #F1F5F9;
+    color: #475569 !important;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 6px;
+    letter-spacing: 0.8px;
+    margin-bottom: 8px;
+}
+.modern-title {
+    font-size: 24px;
+    font-weight: 800;
+    color: #0F172A !important;
+    letter-spacing: -0.5px;
+    margin: 0;
+}
+.modern-subtitle {
+    font-size: 13.5px;
+    color: #64748B !important;
+    margin-top: 4px;
+    font-weight: 400;
+}
 
-        st.markdown("**3. 시트 캐시 및 문서화 즉시 갱신**")
-        if st.button("시트 캐시 & DB 관리대장 즉시 갱신", use_container_width=True):
-            try:
-                records = get_cached_sheet_records(force_refresh=True)
-                col = get_collection()
-                if col:
-                    export_vector_db_documentation(col, GOOGLE_KEY_PATH, SHEET_ID)
-                st.success("갱신 완료 (BIM 파일 {0}개 및 Vector DB 문서 대장 최신화)".format(len(records)))
-            except Exception as e:
-                st.error("갱신 실패: {0}".format(e))
-    elif admin_input != "":
-        st.error("비밀번호가 일치하지 않습니다.")
+div[data-baseweb="tab-list"] {
+    background-color: #E2E8F0 !important;
+    padding: 5px !important;
+    border-radius: 10px !important;
+    gap: 6px !important;
+    width: fit-content !important;
+    border-bottom: none !important;
+    margin-bottom: 18px !important;
+}
+button[data-baseweb="tab"] {
+    background-color: transparent !important;
+    border: none !important;
+    border-radius: 7px !important;
+    padding: 9px 22px !important;
+    height: auto !important;
+    box-shadow: none !important;
+    transition: all 0.15s ease !important;
+}
+button[data-baseweb="tab"] p {
+    font-size: 14.5px !important;
+    font-weight: 600 !important;
+    color: #475569 !important;
+    margin: 0 !important;
+}
+button[data-baseweb="tab"]:hover {
+    background-color: rgba(255, 255, 255, 0.5) !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    background-color: #FFFFFF !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1), 0 1px 2px rgba(15, 23, 42, 0.06) !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] p {
+    color: #0F172A !important;
+    font-weight: 700 !important;
+}
+div[data-baseweb="tab-highlight"] {
+    display: none !important;
+}
+
+span[data-baseweb="tag"] {
+    background-color: #F1F5F9 !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 6px !important;
+    padding: 2px 8px !important;
+}
+span[data-baseweb="tag"] span {
+    color: #0F172A !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+}
+span[data-baseweb="tag"] svg {
+    fill: #475569 !important;
+    color: #475569 !important;
+}
+
+div[data-baseweb="select"] > div {
+    background-color: #FFFFFF !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 8px !important;
+    min-height: 40px !important;
+    box-shadow: none !important;
+}
+div[data-baseweb="select"] > div:hover {
+    border-color: #64748B !important;
+}
+
+div.stButton > button, div.stDownloadButton > button {
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-size: 13.5px !important;
+    padding: 0.5rem 1rem !important;
+    border: 1px solid #CBD5E1 !important;
+    background-color: #FFFFFF !important;
+    color: #1E293B !important;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03) !important;
+    transition: all 0.15s ease !important;
+}
+div.stButton > button:hover, div.stDownloadButton > button:hover {
+    background-color: #F8FAFC !important;
+    border-color: #94A3B8 !important;
+    color: #0F172A !important;
+}
+div.stButton > button[kind="primary"], div.stDownloadButton > button[kind="primary"] {
+    background-color: #0F172A !important;
+    color: #FFFFFF !important;
+    border: 1px solid #0F172A !important;
+}
+div.stButton > button[kind="primary"]:hover, div.stDownloadButton > button[kind="primary"]:hover {
+    background-color: #1E293B !important;
+    border-color: #1E293B !important;
+}
+div.stButton > button[kind="primary"] *, div.stDownloadButton > button[kind="primary"] * {
+    color: #FFFFFF !important;
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: #FFFFFF !important;
+    border: 1px solid #E2E8F0 !important;
+    border-radius: 12px !important;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.02) !important;
+}
+
+.summary-bar {
+    background-color: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.summary-label {
+    font-size: 13.5px;
+    font-weight: 700;
+    color: #334155 !important;
+}
+.summary-chip {
+    display: inline-block;
+    background-color: #F8FAFC;
+    color: #0F172A !important;
+    border: 1px solid #E2E8F0;
+    font-weight: 600;
+    font-size: 12.5px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    margin-left: 6px;
+}
+
+.meta-chip-dark { background-color: #1E293B; color: #FFFFFF !important; padding: 3px 9px; border-radius: 5px; font-size: 12px; font-weight: 600; margin-right: 5px; display: inline-block; }
+.meta-chip { background-color: #F1F5F9; color: #334155 !important; border: 1px solid #E2E8F0; padding: 3px 9px; border-radius: 5px; font-size: 12px; font-weight: 600; margin-right: 5px; display: inline-block; }
+
+div[data-testid="stAlert"] {
+    background-color: #F8FAFC !important;
+    border: 1px solid #E2E8F0 !important;
+    color: #334155 !important;
+    border-radius: 8px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+def resolve_local_file_path(item):
+    for key in ("parent_path", "slide_pdf_path", "server_path", "distributed_path", "drive_link"):
+        p = str(item.get(key, "")).strip()
+        if not p:
+            continue
+        if os.path.exists(p) and os.path.isfile(p):
+            return p
+    return ""
+
+
+def extract_single_pdf_page_bytes(pdf_path, page_num=1):
+    """
+    [실시간 메모리 장표 추출 (On-Demand In-Memory Slicing)]
+    사내 서버에 수백 개의 낱장 PDF 파일을 물리적으로 저장하지 않고,
+    사용자가 열람하거나 다운로드하는 순간 해당 페이지(page_num) 1장만 메모리(io.BytesIO)로 즉시 추출합니다.
+    """
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(pdf_path)
+        total_p = len(reader.pages)
+        idx = max(0, min(int(page_num) - 1, total_p - 1))
+        writer = pypdf.PdfWriter()
+        writer.add_page(reader.pages[idx])
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+    except Exception:
+        try:
+            with open(pdf_path, "rb") as f:
+                return f.read()
+        except Exception:
+            return b""
+
+
+def render_pdf_bytes_iframe(pdf_bytes, page_num=1, height=780):
+    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+    iframe_html = (
+        '<iframe src="data:application/pdf;base64,{0}#page={1}&toolbar=1&navpanes=0&view=FitH" '
+        'width="100%" height="{2}px" style="border: 1px solid #E2E8F0; border-radius: 8px; background: #FFFFFF;"></iframe>'
+    ).format(b64_pdf, page_num, height)
+    st.markdown(iframe_html, unsafe_allow_html=True)
+
+
+def render_visual_media_viewer(item, target_page=1, is_slide_mode=False):
+    fname = item.get("file_name", item.get("parent_file", "샘플자료"))
+    proj_name = item.get("project_name", "사내 수행 프로젝트")
+    slide_title = item.get("slide_title", "")
+    page_num = item.get("page_num", target_page)
+    ext_low = os.path.splitext(fname)[1].lower()
+    local_path = resolve_local_file_path(item)
+
+    head_col1, head_col2 = st.columns([2.7, 1.0])
+    with head_col1:
+        title_display = "{0} ({1}p · {2})".format(fname, page_num, slide_title) if slide_title else fname
+        st.markdown("##### {0}".format(title_display))
+        st.markdown(
+            "<span class='meta-chip-dark'>{0}</span>"
+            "<span class='meta-chip'>용도: {1}</span>"
+            "<span class='meta-chip'>공법: {2}</span>"
+            "<span class='meta-chip'>공종: {3}</span>"
+            "<span class='meta-chip'>업무: {4}</span>".format(
+                proj_name,
+                ", ".join(item.get("usages", [item.get("usage", "일반")])),
+                ", ".join(item.get("methods", [item.get("method_type", "일반")])),
+                ", ".join(item.get("disciplines", [item.get("discipline", "RC")])),
+                ", ".join(item.get("tasks", [item.get("task_type", "설계검토")]))
+            ),
+            unsafe_allow_html=True
+        )
+
+    if not local_path:
+        st.warning("사내 서버에서 원본 파일 경로를 찾을 수 없습니다: {0}".format(item.get("server_path", "")))
+        return
+
+    if ext_low in {".mp4", ".webm", ".mov", ".avi"}:
+        with head_col2:
+            with open(local_path, "rb") as f_v:
+                st.download_button("영상 원본 다운로드", data=f_v, file_name=fname, use_container_width=True)
+        st.video(local_path)
+        return
+
+    # 개별 장표 모드이고 PDF인 경우 해당 1페이지만 메모리에서 실시간 추출하여 고속 렌더링
+    if ext_low == ".pdf" and is_slide_mode:
+        display_bytes = extract_single_pdf_page_bytes(local_path, page_num=page_num)
+        dl_name = "{0}_{1:02d}p.pdf".format(os.path.splitext(fname)[0], page_num)
     else:
-        st.caption("일반 이용자 모드입니다. 관리자 암호 입력 시 모델 검수(QA), 파일 카탈로그, Vector DB 구조 검증 탭이 열립니다.")
+        with open(local_path, "rb") as f_dl:
+            display_bytes = f_dl.read()
+        dl_name = os.path.basename(local_path)
 
-
-def render_main_chatbot_ui(manual_list, category_list, admin_mode=False):
-    """일반 이용자 및 관리자 공통 메인 화면: AI 검색 및 문서 비교 챗봇 UI를 렌더링합니다."""
-    col_cat, col_doc, col_info = st.columns([2, 2, 2])
-
-    with col_cat:
-        selected_category = st.selectbox(
-            "업무 목적별 9대 문서 분류 필터",
-            options=["전체 분류"] + category_list
+    with head_col2:
+        st.download_button(
+            label="현재 장표/파일 다운로드",
+            data=display_bytes,
+            file_name=dl_name,
+            key="dl_btn_{0}_{1}_{2}".format(fname, page_num, is_slide_mode),
+            use_container_width=True
         )
-    with col_doc:
-        selected_manuals = st.multiselect(
-            "비교/참조할 특정 파일 지정 (복수 선택 시 1:1 균등 비교 작동)",
-            options=manual_list,
-            placeholder="비워두면 전체 문서에서 자동 분산 검색"
-        )
-    with col_info:
-        st.caption("현재 학습된 표준 문서: **{0}개**".format(len(manual_list)))
-        st.caption("비교할 문서 2개 이상을 선택하거나 질문하면 표로 비교·요약해 드립니다.")
 
-    st.divider()
+    st.write("")
+    if ext_low in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+        st.image(display_bytes, caption=fname, use_container_width=True)
+    elif ext_low == ".pdf":
+        # 실시간 1페이지 추출 시에는 추출된 파일의 1페이지가 곧 해당 장표임
+        render_pdf_bytes_iframe(display_bytes, page_num=1 if is_slide_mode else target_page, height=760)
+    elif ext_low in {".xlsx", ".xls", ".csv"}:
+        try:
+            import openpyxl
+            if ext_low == ".csv":
+                import csv as py_csv
+                text_data = display_bytes.decode("utf-8-sig", errors="replace").splitlines()
+                reader = list(py_csv.reader(text_data))
+                if reader:
+                    st.dataframe(reader[:250], use_container_width=True, height=620)
+            else:
+                wb = openpyxl.load_workbook(io.BytesIO(display_bytes), data_only=True)
+                sheet_tabs = st.tabs(wb.sheetnames)
+                for s_tab, s_name in zip(sheet_tabs, wb.sheetnames):
+                    with s_tab:
+                        ws = wb[s_name]
+                        rows_data = []
+                        for r in ws.iter_rows(values_only=True):
+                            if any(cell is not None for cell in r):
+                                rows_data.append(["" if c is None else str(c) for c in r])
+                        if rows_data:
+                            st.dataframe(rows_data[:250], use_container_width=True, height=580)
+        except Exception as e:
+            st.warning("엑셀 표 미리보기 오류: {0}".format(e))
+    else:
+        st.info("전용 소프트웨어 원본 파일({0})입니다. 우측 상단 다운로드 버튼을 눌러 활용하세요.".format(ext_low))
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
-    for idx, message in enumerate(st.session_state.messages):
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message["role"] == "assistant":
-                st.download_button(
-                    label="답변 내용 다운로드 (.md)",
-                    data=message["content"].encode("utf-8-sig"),
-                    file_name="BIM_AI_답변_{0}.md".format(idx),
-                    mime="text/markdown",
-                    key="dl_{0}".format(idx)
-                )
+def match_multi_categories(item_list_field, selected_list):
+    if not selected_list:
+        return True
+    item_set = set(item_list_field or [])
+    return any(sel in item_set for sel in selected_list)
 
-    if prompt := st.chat_input("질문을 입력하세요 (예: 조달청 지침서와 사내 기준 비교해줘 / 키움 단열 수량산출서 수식 알려줘)"):
-        previous_history = list(st.session_state.messages)
 
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+def build_multi_project_merged_pdf(proj_slides_map, max_slides_per_project=8):
+    """원본 PDF에서 조건에 맞는 페이지 번호들만 실시간 메모리 추출하여 1개의 브리핑북 PDF로 병합합니다."""
+    import pypdf
+    merger = pypdf.PdfWriter()
+    total_added = 0
+    reader_cache = {}
 
-        with st.chat_message("assistant"):
-            with st.spinner("사내 지식 저장소와 구글 드라이브를 교차 분석하고 있습니다..."):
+    for proj_name, s_list in proj_slides_map.items():
+        cnt = 0
+        for s in s_list:
+            if cnt >= max_slides_per_project:
+                break
+            sp = resolve_local_file_path(s)
+            p_num = int(s.get("page_num", 1))
+            if sp and sp.lower().endswith(".pdf") and os.path.exists(sp):
                 try:
-                    response, manual_ctx, file_ctx = get_ai_response(
-                        prompt,
-                        chat_history=previous_history,
-                        return_context=True,
-                        target_manuals=selected_manuals,
-                        target_category=selected_category
+                    if sp not in reader_cache:
+                        reader_cache[sp] = pypdf.PdfReader(sp)
+                    reader = reader_cache[sp]
+                    idx = max(0, min(p_num - 1, len(reader.pages) - 1))
+                    merger.add_page(reader.pages[idx])
+                    cnt += 1
+                    total_added += 1
+                except Exception:
+                    continue
+    if total_added == 0:
+        return None, 0
+    out_buf = io.BytesIO()
+    merger.write(out_buf)
+    return out_buf.getvalue(), total_added
+
+
+def build_multi_project_structured_zip(proj_files_map, proj_slides_map, summary_md_text=""):
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if summary_md_text:
+            zf.writestr("00_프로젝트별_산출물_AI비교분석.md", summary_md_text.encode("utf-8-sig"))
+
+        merged_pdf_bytes, slide_cnt = build_multi_project_merged_pdf(proj_slides_map, max_slides_per_project=8)
+        if merged_pdf_bytes:
+            zf.writestr("01_핵심장표_통합발췌본({0}장).pdf".format(slide_cnt), merged_pdf_bytes)
+
+        for proj_name, f_list in proj_files_map.items():
+            safe_proj = re.sub(r'[\\/:*?"<>|]', '_', proj_name)
+            for it in f_list[:15]:
+                lp = resolve_local_file_path(it)
+                if lp and os.path.exists(lp):
+                    try:
+                        zf.write(lp, arcname="{0}/원본파일/{1}".format(safe_proj, it["file_name"]))
+                    except Exception:
+                        pass
+
+        for proj_name, s_list in proj_slides_map.items():
+            safe_proj = re.sub(r'[\\/:*?"<>|]', '_', proj_name)
+            for s in s_list[:10]:
+                sp = resolve_local_file_path(s)
+                p_num = int(s.get("page_num", 1))
+                p_fname = os.path.splitext(s.get("parent_file", "slide"))[0]
+                if sp and sp.lower().endswith(".pdf") and os.path.exists(sp):
+                    single_bytes = extract_single_pdf_page_bytes(sp, page_num=p_num)
+                    if single_bytes:
+                        zf.writestr(
+                            "{0}/발췌장표/{1}_{2:02d}p.pdf".format(safe_proj, p_fname, p_num),
+                            single_bytes
+                        )
+    return zip_buf.getvalue()
+
+
+# ==============================================================================
+# [상단 헤더 영역]
+# ==============================================================================
+st.markdown("""
+<div class="modern-header">
+    <div>
+        <span class="modern-badge">BIM FACTORY INTERNAL SYSTEM</span>
+        <h1 class="modern-title">비아이엠팩토리 사내 통합 자료 기반 AI 업무 지원 시스템</h1>
+        <div class="modern-subtitle">프로젝트 산출물 아카이브 · 사내 표준 지식 AI 검색 · Revit 세팅 자동화</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# [좌측 사이드바: BF 파일 분석 & 동기화]
+# ==============================================================================
+with st.sidebar:
+    st.markdown("#### 사내 서버 동기화 제어")
+    st.caption("연결 경로: {0}".format(SERVER_STORAGE_PATH))
+
+    if st.button("BF 파일 분석 & 동기화", use_container_width=True, type="primary"):
+        with st.spinner("사내 서버(99_bf_archive) 분석, 산출물 배포 및 벡터 DB·관리대장 갱신 중..."):
+            items, slides, _ = scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True)
+            get_cached_sheet_records(force_refresh=True)
+        st.success("동기화 완료: 산출물 {0}건 / 장표 {1}장".format(len(items), len(slides)))
+
+    if st.button("사내 서버 폴더 열기", use_container_width=True):
+        try:
+            os.startfile(SERVER_STORAGE_PATH)
+        except Exception:
+            pass
+
+# ==============================================================================
+# [3대 핵심 카테고리 탭]
+# ==============================================================================
+tab_archive, tab_qa, tab_revit = st.tabs([
+    TAB1_TITLE,
+    TAB2_TITLE,
+    TAB3_TITLE
+])
+
+# ==============================================================================
+# 1. 산출물 아카이브
+# ==============================================================================
+with tab_archive:
+    with st.container(border=True):
+        fc1, fc2, fc3, fc4, fc5 = st.columns([1.2, 1.1, 1.2, 1.2, 1.15])
+        with fc1:
+            sel_usages = st.multiselect("① 용도 선택", list(TAXONOMY_USAGE.keys()), placeholder="데이터센터, 공동주택 등")
+        with fc2:
+            sel_methods = st.multiselect("② 공법 선택", list(TAXONOMY_METHOD.keys()), placeholder="탑다운, 순타, PC, 모듈")
+        with fc3:
+            sel_discs = st.multiselect("③ 공종 선택", list(TAXONOMY_DISCIPLINE.keys()), placeholder="RC, 철골, 단열, 방수 등")
+        with fc4:
+            sel_tasks = st.multiselect("④ 업무 선택", list(TAXONOMY_TASK.keys()), placeholder="설계검토, 수량, 공정시뮬레이션")
+        with fc5:
+            view_mode = st.radio("열람 기준", ["개별 장표(슬라이드)", "원본 파일(엑셀·영상·문서)"], index=0)
+
+    all_slides = load_showcase_slides()
+    all_items = load_showcase_catalog()
+
+    matched_slides = [
+        s for s in all_slides
+        if match_multi_categories(s.get("usages"), sel_usages)
+        and match_multi_categories(s.get("methods"), sel_methods)
+        and match_multi_categories(s.get("disciplines"), sel_discs)
+        and match_multi_categories(s.get("tasks"), sel_tasks)
+    ]
+
+    matched_files = [
+        it for it in all_items
+        if match_multi_categories(it.get("usages"), sel_usages)
+        and match_multi_categories(it.get("methods"), sel_methods)
+        and match_multi_categories(it.get("disciplines"), sel_discs)
+        and match_multi_categories(it.get("tasks"), sel_tasks)
+    ]
+
+    proj_files_map = defaultdict(list)
+    for it in matched_files:
+        proj_files_map[it.get("project_name") or "사내 수행 프로젝트"].append(it)
+
+    proj_slides_map = defaultdict(list)
+    for s in matched_slides:
+        proj_slides_map[s.get("project_name") or "사내 수행 프로젝트"].append(s)
+
+    all_matched_projects = sorted(list(set(list(proj_files_map.keys()) + list(proj_slides_map.keys()))))
+
+    bar_left, bar_btn1, bar_btn2, bar_btn3 = st.columns([1.85, 1.05, 1.05, 1.05])
+    with bar_left:
+        st.markdown(
+            "<div class='summary-bar'>"
+            "<span class='summary-label'>조회된 사내 산출물</span>"
+            "<div>"
+            "<span class='summary-chip'>프로젝트 {0}개</span>"
+            "<span class='summary-chip'>장표 {1}장</span>"
+            "<span class='summary-chip'>파일 {2}건</span>"
+            "</div>"
+            "</div>".format(len(all_matched_projects), len(matched_slides), len(matched_files)),
+            unsafe_allow_html=True
+        )
+    with bar_btn1:
+        merged_pdf_data, merged_cnt = build_multi_project_merged_pdf(proj_slides_map, max_slides_per_project=8)
+        if merged_pdf_data:
+            st.download_button(
+                label="발췌 장표 PDF 다운로드 ({0}장)".format(merged_cnt),
+                data=merged_pdf_data,
+                file_name="비아이엠팩토리_산출물_발췌장표.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary"
+            )
+    with bar_btn2:
+        if matched_files or matched_slides:
+            zip_pkg_data = build_multi_project_structured_zip(
+                proj_files_map,
+                proj_slides_map,
+                summary_md_text=st.session_state.get("multi_proj_summary_md", "")
+            )
+            st.download_button(
+                label="프로젝트별 통합 ZIP 다운로드",
+                data=zip_pkg_data,
+                file_name="비아이엠팩토리_산출물_통합패키지.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+    with bar_btn3:
+        if st.button("AI 프로젝트 통합 비교·분석", use_container_width=True):
+            if not all_matched_projects:
+                st.warning("비교 분석할 사내 산출물 프로젝트가 없습니다.")
+            else:
+                proj_context_lines = []
+                for p_name in all_matched_projects:
+                    p_files = proj_files_map.get(p_name, [])
+                    p_slides = proj_slides_map.get(p_name, [])
+                    f_names = [f["file_name"] for f in p_files[:8]]
+                    s_previews = [
+                        "({0}p) {1}: {2}".format(s["page_num"], s["slide_title"], s["slide_text"][:160])
+                        for s in p_slides[:5]
+                    ]
+                    proj_context_lines.append(
+                        "■ 사내 프로젝트명: {0}\n- 산출물 파일: {1}\n- 주요 장표 내용:\n  {2}".format(
+                            p_name, ", ".join(f_names), "\n  ".join(s_previews)
+                        )
                     )
-                    st.markdown(response)
+                synth_q = (
+                    "발주처 지침서가 아닌 당사(비아이엠팩토리)가 실제 수행한 아래 {0}개 프로젝트({1})의 사내 산출물 자료를 바탕으로, "
+                    "프로젝트별 주요 설계검토/간섭사례, 적용 공법·공종 특징, 산출물 구성을 영업 브리핑용으로 비교·분석해줘.\n\n{2}"
+                ).format(len(all_matched_projects), ", ".join(all_matched_projects), "\n\n".join(proj_context_lines))
+                with st.spinner("발췌된 사내 프로젝트 산출물들을 AI가 통합 비교·분석하고 있습니다..."):
+                    ai_comp_ans = get_ai_response(synth_q, channel="Web_Archive_Compare")
+                    st.session_state["multi_proj_summary_md"] = ai_comp_ans
 
-                    st.download_button(
-                        label="답변 내용 다운로드 (.md)",
-                        data=response.encode("utf-8-sig"),
-                        file_name="BIM_AI_최신답변.md",
-                        mime="text/markdown",
-                        key="dl_latest"
+    if st.session_state.get("multi_proj_summary_md"):
+        with st.expander("AI 다중 프로젝트 산출물 비교·분석 리포트 보기", expanded=True):
+            st.markdown(st.session_state["multi_proj_summary_md"])
+
+    if view_mode.startswith("개별 장표"):
+        if not matched_slides:
+            st.info(
+                "선택하신 조건에 해당하는 사내 산출물 장표가 없습니다. "
+                "(발주처 지침서 및 가이드북은 자동 제외되었으며, 좌측 사이드바에서 'BF 파일 분석 & 동기화'를 실행하면 최신 기준이 반영됩니다.)"
+            )
+        else:
+            col_nav, col_stage = st.columns([1.05, 2.55])
+            with col_nav:
+                with st.container(border=True):
+                    st.markdown("##### 1) 프로젝트 필터")
+                    proj_options = ["전체 프로젝트 ({0}장)".format(len(matched_slides))] + [
+                        "{0} ({1}장)".format(p, len(proj_slides_map[p])) for p in sorted(proj_slides_map.keys())
+                    ]
+                    sel_proj_label = st.selectbox("프로젝트 선택", proj_options, label_visibility="collapsed")
+
+                    if sel_proj_label.startswith("전체 프로젝트"):
+                        active_slides = matched_slides
+                    else:
+                        chosen_p_name = sel_proj_label.rsplit(" (", 1)[0]
+                        active_slides = proj_slides_map[chosen_p_name]
+
+                    st.markdown("##### 2) 산출물 장표 선택")
+                    slide_labels = [
+                        "[{0}p] {1} ({2})".format(s["page_num"], s["slide_title"][:24], s.get("project_name", "")[:10])
+                        for s in active_slides
+                    ]
+                    chosen_s_idx = st.radio(
+                        "장표 목록",
+                        range(len(active_slides)),
+                        format_func=lambda i: slide_labels[i],
+                        label_visibility="collapsed"
                     )
+                    cur_slide = active_slides[chosen_s_idx]
 
-                    if admin_mode:
-                        with st.expander("[관리자 전용] 시스템 DB 검색 원본 결과 확인"):
-                            st.markdown("**[적용 필터 - 분류: {0} / 지정 문서: {1}]**".format(
-                                selected_category, selected_manuals if selected_manuals else "자동 분산 검색"
-                            ))
-                            st.markdown("**[구글 시트 (BIM 파일) 검색 결과]**")
-                            st.text(file_ctx)
-                            st.markdown("**[ChromaDB (매뉴얼/산출서/세팅기준) 검색 결과]**")
-                            st.text(manual_ctx)
+            with col_stage:
+                with st.container(border=True):
+                    render_visual_media_viewer(cur_slide, target_page=cur_slide.get("page_num", 1), is_slide_mode=True)
 
-                except Exception as e:
-                    response = "데이터베이스 연결 또는 검색 중 오류가 발생했습니다.\n에러 내용: {0}".format(e)
-                    st.error(response)
+    else:
+        if not matched_files:
+            st.info("선택하신 필터 조건에 해당하는 사내 산출물 원본 파일이 없습니다.")
+        else:
+            col_nav, col_stage = st.columns([1.05, 2.55])
+            with col_nav:
+                with st.container(border=True):
+                    st.markdown("##### 1) 프로젝트 필터")
+                    f_proj_options = ["전체 프로젝트 ({0}건)".format(len(matched_files))] + [
+                        "{0} ({1}건)".format(p, len(proj_files_map[p])) for p in sorted(proj_files_map.keys())
+                    ]
+                    sel_f_proj = st.selectbox("파일 프로젝트 선택", f_proj_options, label_visibility="collapsed")
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+                    if sel_f_proj.startswith("전체 프로젝트"):
+                        active_files = matched_files
+                    else:
+                        chosen_fp_name = sel_f_proj.rsplit(" (", 1)[0]
+                        active_files = proj_files_map[chosen_fp_name]
 
+                    st.markdown("##### 2) 산출물 원본 파일 선택")
+                    f_labels = [
+                        "[{0}] {1}".format(it.get("media_type", "")[:6], it["file_name"])
+                        for it in active_files
+                    ]
+                    chosen_f_idx = st.radio(
+                        "파일 목록",
+                        range(len(active_files)),
+                        format_func=lambda i: f_labels[i],
+                        label_visibility="collapsed"
+                    )
+                    sel_f = active_files[chosen_f_idx]
+                    page_jump = 1
+                    if sel_f.get("file_name", "").lower().endswith(".pdf") and sel_f.get("slide_count", 0) > 1:
+                        page_jump = st.number_input(
+                            "이동할 페이지 번호",
+                            min_value=1,
+                            max_value=max(1, sel_f.get("slide_count", 50)),
+                            value=1
+                        )
 
-# --- [메인 화면 헤더] ---
-st.title("BIM 데이터 어시스턴트")
-manual_list = get_indexed_manual_list()
-category_list = get_indexed_categories()
+            with col_stage:
+                with st.container(border=True):
+                    render_visual_media_viewer(sel_f, target_page=page_jump, is_slide_mode=False)
 
-# --- [역할 기반 화면 분기: 일반 이용자(단독 메인 화면) vs 관리자(4대 관리 탭 활성)] ---
-if not is_admin:
-    st.caption("사내 표준 지침서, 검토보고서 비교, 수량산출/견적 기준 검색 및 BIM 패밀리/템플릿 링크를 찾아드립니다.")
-    render_main_chatbot_ui(manual_list, category_list, admin_mode=False)
+# ==============================================================================
+# 2. AI 지식 어시스턴트 (참조 원본 파일 및 .md 리포트 원클릭 다운로드 포함)
+# ==============================================================================
+with tab_qa:
+    with st.container(border=True):
+        st.markdown("#### 사내 표준 지침 및 프로젝트 사례 AI 검색")
+        st.caption("발주처 지침서(조달청·LH 등)를 포함한 전체 표준 문서와 과거 검토보고서를 통합 검색하고 관련 원본 파일을 즉시 다운로드합니다.")
 
-else:
-    st.caption("[관리자 모드 실행 중] 챗봇 메인 화면 외에 Revit 제어·모델 검수(QA), 전체 파일 카탈로그, Vector DB 구조 검증 및 문서화 탭을 관리할 수 있습니다.")
-    tab_chat, tab_generator, tab_catalog, tab_inspector = st.tabs([
-        "AI 검색 및 문서 비교 챗봇 (메인)",
-        "[관리자] Revit 무개입 제어 및 양방향 검수(QA)",
-        "[관리자] 전체 BIM 파일 카탈로그",
-        "[관리자] Vector DB 데이터 구조 및 문서화 관리"
-    ])
+        qa_c1, qa_c2, qa_c3, qa_c4 = st.columns(4)
+        with qa_c1:
+            q_usages = st.multiselect("① 용도", list(TAXONOMY_USAGE.keys()), key="qu", placeholder="전체 용도")
+        with qa_c2:
+            q_methods = st.multiselect("② 공법", list(TAXONOMY_METHOD.keys()), key="qm", placeholder="전체 공법")
+        with qa_c3:
+            q_discs = st.multiselect("③ 공종", list(TAXONOMY_DISCIPLINE.keys()), key="qd", placeholder="전체 공종")
+        with qa_c4:
+            q_tasks = st.multiselect("④ 업무", list(TAXONOMY_TASK.keys()), key="qt", placeholder="전체 업무")
 
-    # 탭 1: 메인 챗봇
-    with tab_chat:
-        render_main_chatbot_ui(manual_list, category_list, admin_mode=True)
+        q_col_input, q_col_doc = st.columns([2.2, 1.2])
+        with q_col_input:
+            extra_query = st.text_input(
+                "질문 또는 요청사항 입력",
+                placeholder="예: 데이터센터 프로젝트들의 주요 간섭 검토 항목과 단열재 수량 산출 기준 알려줘"
+            )
+        with q_col_doc:
+            manuals_all = get_indexed_manual_list()
+            sel_mans_qa = st.multiselect("특정 문서만 지정 검색 (선택사항)", manuals_all, placeholder="비워두면 전체 자동 검색")
 
-    # 탭 2: 관리자 전용 Revit 제어 및 실시간 모델 검수(QA)
-    with tab_generator:
-        st.subheader("표준 가이드라인 및 스펙북 기반 Revit 무개입 Codex 제어 및 양방향 검수기")
+        if st.button("AI 실무 가이드 및 관련 자료 검색", type="primary", use_container_width=True):
+            tag_parts = []
+            if q_usages:
+                tag_parts.append("용도({0})".format(", ".join(q_usages)))
+            if q_methods:
+                tag_parts.append("공법({0})".format(", ".join(q_methods)))
+            if q_discs:
+                tag_parts.append("공종({0})".format(", ".join(q_discs)))
+            if q_tasks:
+                tag_parts.append("업무({0})".format(", ".join(q_tasks)))
 
-        dyn_json_str, dyn_saved_path, live_py_path = generate_dynamo_player_file()
-        is_revit_online, revit_status_msg = check_revit_connection()
+            synthesized_query = "{0} 관련 사내 기준, 주요 검토 사례 및 활용 가능한 산출물 파일을 정리해줘. {1}".format(
+                " / ".join(tag_parts) if tag_parts else "전체 표준",
+                extra_query.strip()
+            ).strip()
 
+            with st.spinner("사내 지식베이스를 분석하고 관련 원본 파일을 탐색하고 있습니다..."):
+                ans, m_ctx, f_ctx = get_ai_response(
+                    synthesized_query,
+                    return_context=True,
+                    target_manuals=sel_mans_qa if sel_mans_qa else None,
+                    channel="Web_QA"
+                )
+                ref_file_tuples = find_referenced_server_file_paths(ans, m_ctx, f_ctx, max_files=6)
+            st.session_state["last_qa_answer"] = ans
+            st.session_state["last_qa_ctx"] = (m_ctx, f_ctx)
+            st.session_state["last_qa_files"] = ref_file_tuples
+
+    if st.session_state.get("last_qa_answer"):
         with st.container(border=True):
-            col_st1, col_st2, col_st3 = st.columns([2, 2, 2])
-            with col_st1:
-                st.markdown("#### 1. 실시간 Revit 연결 상태")
-                if is_revit_online:
-                    st.success("무개입 Codex 활성: {0}".format(revit_status_msg))
-                else:
-                    st.warning("상태: {0}".format(revit_status_msg))
-                if st.button("연결 상태 새로고침", use_container_width=True):
-                    st.rerun()
+            st.markdown(st.session_state["last_qa_answer"])
+            st.divider()
 
-            with col_st2:
-                st.markdown("#### 2. 무개입 수신기 원클릭 설치 (pyRevit)")
-                st.caption("클릭 시 `%APPDATA%\\pyRevit\\Extensions`에 양방향 수신기(/execute 및 /inspect)를 자동 설치합니다.")
-                if st.button("pyRevit 양방향 수신기 자동 설치/업데이트", use_container_width=True):
-                    paths, _ = install_pyrevit_extension()
-                    st.success("수신기 설치 완료: " + ", ".join(paths))
+            # AI 답변 전문(.md) 및 참조된 사내 서버 파일 원클릭 다운로드 영역
+            st.markdown("##### 관련 사내 서버 문서 및 AI 가이드 즉시 다운로드")
+            ref_files = st.session_state.get("last_qa_files", [])
+            dl_cols = st.columns(min(4, max(1, len(ref_files) + 1)))
 
-            with col_st3:
-                st.markdown("#### 3. Dynamo 플레이어 실행기 (대체용)")
-                st.caption("pyRevit 없이 사용할 경우 Dynamo 플레이어에 `{0}` 폴더를 등록해 사용하세요.".format(os.path.dirname(dyn_saved_path)))
+            with dl_cols[0]:
                 st.download_button(
-                    label="Dynamo 실행기 다운로드 (.dyn)",
-                    data=dyn_json_str.encode("utf-8"),
-                    file_name="BF_AI세팅실행기.dyn",
-                    mime="application/json",
-                    use_container_width=True
+                    label="AI 답변 가이드 전문 (.md)",
+                    data=st.session_state["last_qa_answer"].encode("utf-8-sig"),
+                    file_name="BF_AI_실무가이드_답변전문.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    type="primary"
                 )
 
-        st.divider()
+            for idx, (r_fname, r_fpath) in enumerate(ref_files):
+                if os.path.exists(r_fpath):
+                    col_target = dl_cols[(idx + 1) % len(dl_cols)]
+                    with col_target:
+                        try:
+                            with open(r_fpath, "rb") as rf:
+                                st.download_button(
+                                    label="원본: {0}".format(r_fname[:22]),
+                                    data=rf.read(),
+                                    file_name=r_fname,
+                                    key="qa_ref_dl_{0}_{1}".format(idx, r_fname),
+                                    use_container_width=True
+                                )
+                        except Exception:
+                            pass
 
-        gen_manuals = st.multiselect(
-            "참조 및 대조할 기준 문서 선택 (예: 조달청 지침서, 스펙북, BF_SM_공유 매개변수.txt, 검토리스트 등)",
-            options=manual_list,
-            placeholder="비워두면 관련 기준 문서를 AI가 자동으로 찾아 참조합니다",
-            key="gen_multiselect"
-        )
+            with st.expander("참조된 사내 문서 원문 조각 확인"):
+                m_c, f_c = st.session_state.get("last_qa_ctx", ("", ""))
+                st.text(m_c)
+                st.text(f_c)
 
-        col_gen1, col_gen2 = st.columns(2)
-
-        with col_gen1:
-            st.markdown("### A. Revit 공유 매개변수 파일(`.txt`) 생성")
-            st.caption("사내 공유 매개변수 포맷과 조달청/발주처 지침을 결합하여 레빗에 바로 로드 가능한 신규 `.txt` 파일을 생성합니다.")
+# ==============================================================================
+# 3. Revit 자동 세팅
+# ==============================================================================
+with tab_revit:
+    r_col1, r_col2 = st.columns(2)
+    with r_col1:
+        with st.container(border=True):
+            st.markdown("#### 공유 매개변수(.txt) 자동 생성기")
+            st.caption("사내 및 발주처(조달청·LH 등) 기준에 맞춘 UTF-16 표준 공유 매개변수 파일을 즉시 생성합니다.")
             param_req = st.text_area(
-                "추가하거나 반영할 매개변수 요구사항 입력",
-                value="기존 사내 공유 매개변수에 더해, 조달청 BIM 납품 기준에 필요한 구조/토목/건축 필수 속성(분류코드, 시공구역, 콘크리트강도, 물량산출여부 등)을 추가해서 공유 매개변수 파일을 만들어줘.",
-                height=140
+                "추가할 매개변수 조건 입력",
+                placeholder="예: 조달청 기준 구조 및 마감 물량 산출용 필수 공유 매개변수 세트 생성",
+                height=110
             )
-            if st.button("공유 매개변수 (.txt) 파일 생성", use_container_width=True):
-                with st.spinner("가이드라인 분석 및 Revit 표준 포맷(.txt) 조립 중..."):
-                    try:
-                        txt_content, param_preview = generate_revit_shared_param_file(param_req, target_manuals=gen_manuals)
-                        st.success("총 {0}개의 매개변수가 포함된 파일이 생성되었습니다.".format(len(param_preview)))
-                        st.dataframe(param_preview, use_container_width=True, hide_index=True)
-                        st.download_button(
-                            label="생성된 공유 매개변수 파일 다운로드 (BF_Custom_SharedParams.txt)",
-                            data=txt_content.encode("utf-16"),
-                            file_name="BF_Custom_SharedParams.txt",
-                            mime="text/plain",
-                            use_container_width=True
-                        )
-                    except Exception as e:
-                        st.error("파일 생성 중 오류 발생: {0}".format(e))
-
-        with col_gen2:
-            st.markdown("### B. 템플릿(레벨/그리드/뷰) 및 재료 완전 무개입 Codex 실행")
-            st.caption("버튼을 누르면 열려 있는 Revit에 AI가 직접 접속해 모델을 세팅하며, 에러 발생 시 최대 3회까지 스스로 코드를 고쳐 재실행합니다.")
-            script_req = st.text_area(
-                "프로젝트 초기 세팅 및 스펙북 재료 요구사항 입력",
-                value="프로젝트명 '신규 사옥 신축공사', 층고 4200mm 기준 지상 1층~지상 5층 레벨 생성, X축 8000mm 간격 그리드 5개(1~5열) 및 Y축 8000mm 간격 그리드 4개(A~D열) 생성, 스펙북 기준 외부 화강석(RGB 190,190,185) 및 로이복층유리(RGB 150,200,220, 투명도 70) 재료를 자동 생성해줘.",
-                height=140
-            )
-            if st.button("완전 무개입 Codex 실행 (Revit 실시간 직접 제어)", use_container_width=True):
-                with st.spinner("AI 코드 생성 및 Revit 실시간 주입/자율 디버깅 수행 중..."):
-                    try:
-                        success, logs, full_desc, final_code = execute_in_revit_with_self_healing(
-                            script_req,
-                            target_manuals=gen_manuals,
-                            max_attempts=3
-                        )
-                        if success:
-                            st.success("Revit 무개입 자동 세팅이 완료되었습니다! Revit 화면을 확인하세요.")
-                        else:
-                            st.warning("실시간 직접 제어 대신 로컬 브릿지(live_setup.py)에 코드가 저장되었습니다. 아래 로그를 확인하세요.")
-
-                        with st.expander("Codex 실시간 실행 및 자율 디버깅 로그", expanded=True):
-                            st.code("\n".join(logs), language="text")
-
-                        st.download_button(
-                            label="최종 검증된 Revit 세팅 스크립트 다운로드 (Revit_Auto_Setup.py)",
-                            data=final_code.encode("utf-8-sig"),
-                            file_name="Revit_Auto_Setup.py",
-                            mime="text/x-python",
-                            use_container_width=True
-                        )
-                        with st.expander("세팅 내역 설명 및 최종 파이썬 코드 확인"):
-                            st.markdown(full_desc)
-                            st.code(final_code, language="python")
-                    except Exception as e:
-                        st.error("Codex 실행 중 오류 발생: {0}".format(e))
-
-        st.divider()
-
-        st.markdown("### C. 실시간 Revit 모델 양방향 검수 (Live Model QA & Auto-Fix)")
-        st.caption("현재 열려 있는 Revit 모델의 내부 데이터(레벨, 그리드, 공유 매개변수 바인딩, 재료 RGB 등)를 실시간으로 읽어와 Vector DB 기준 문서와 대조 검수합니다.")
-
-        qa_focus_input = st.text_input(
-            "중점 검수 항목 입력",
-            value="현재 열려 있는 Revit 모델의 프로젝트 정보, 레벨/그리드 구성, 사내 표준 공유 매개변수 바인딩 여부, 재료 세팅 상태를 기준 문서와 비교해서 검수표를 작성해줘."
-        )
-
-        if st.button("열려 있는 Revit 모델 실시간 스캔 및 AI 표준 검수 실행", use_container_width=True):
-            with st.spinner("실행 중인 Revit 모델 내부 데이터를 스캔하고 Vector DB 기준 문서와 대조 중입니다..."):
-                qa_ok, snapshot_data, qa_report_md, fix_code = run_live_model_qa(qa_focus_input, target_manuals=gen_manuals)
-                st.session_state["last_qa_ok"] = qa_ok
-                st.session_state["last_qa_snapshot"] = snapshot_data
-                st.session_state["last_qa_report"] = qa_report_md
-                st.session_state["last_qa_fix_code"] = fix_code
-
-        if "last_qa_report" in st.session_state and st.session_state["last_qa_report"]:
-            if st.session_state.get("last_qa_ok"):
-                st.success("실시간 Revit 모델 스캔 및 AI 양방향 검수 완료")
-                with st.expander("1. Revit에서 실시간 추출된 모델 원본 스냅샷 (JSON 데이터)", expanded=False):
-                    st.json(st.session_state["last_qa_snapshot"])
-
-                st.markdown("#### 2. AI 표준 대조 검수 보고서")
-                st.markdown(st.session_state["last_qa_report"])
-
-                col_qa_btn1, col_qa_btn2 = st.columns(2)
-                with col_qa_btn1:
+            if st.button("공유 매개변수 파일(.txt) 생성", type="primary", use_container_width=True):
+                if param_req.strip():
+                    with st.spinner("Revit 공유 매개변수 규격 파일 생성 중..."):
+                        txt_out, p_list = generate_revit_shared_param_file(param_req.strip())
+                    st.success("총 {0}개 매개변수 세트 생성 완료".format(len(p_list)))
                     st.download_button(
-                        label="AI 모델 검수 보고서 다운로드 (Revit_Live_QA_Report.md)",
-                        data=st.session_state["last_qa_report"].encode("utf-8-sig"),
-                        file_name="Revit_Live_QA_Report.md",
-                        mime="text/markdown",
+                        "BF_Custom_SharedParams.txt 다운로드",
+                        data=txt_out.encode("utf-16"),
+                        file_name="BF_Custom_SharedParams.txt",
                         use_container_width=True
                     )
-                with col_qa_btn2:
-                    if st.session_state.get("last_qa_fix_code"):
-                        if st.button("검수 지적사항 Revit 모델에 즉시 자동 보정(Auto-Fix) 실행", use_container_width=True):
-                            with st.spinner("검수 지적사항 보정 코드를 Revit에 실시간 주입하고 있습니다..."):
-                                fix_ok, fix_logs, _, _ = execute_in_revit_with_self_healing(
-                                    "양방향 검수 지적사항 자동 보정",
-                                    target_manuals=gen_manuals,
-                                    max_attempts=3,
-                                    custom_code=st.session_state["last_qa_fix_code"]
-                                )
-                                if fix_ok:
-                                    st.success("검수 지적사항이 Revit 모델에 자동으로 보정되었습니다!")
-                                else:
-                                    st.warning("자동 보정 중 일부 항목을 브릿지에 저장했습니다. 로그를 확인하세요.")
-                                with st.expander("자동 보정 실행 로그", expanded=True):
-                                    st.code("\n".join(fix_logs), language="text")
-            else:
-                st.error(st.session_state["last_qa_report"])
-
-    # 탭 3: 관리자 전용 전체 BIM 파일 카탈로그
-    with tab_catalog:
-        st.subheader("등록된 BIM 파일 및 템플릿 목록 (Google Sheets 1번째 탭 연동)")
-        try:
-            records = get_cached_sheet_records()
-            if records:
-                categories = sorted(list({str(r.get("category", "미분류")) for r in records if r.get("category")}))
-                selected_cat = st.selectbox("분류(Category) 필터", ["전체 보기"] + categories)
-
-                filtered_records = records if selected_cat == "전체 보기" else [r for r in records if r.get("category") == selected_cat]
-                st.caption("조회된 파일 수: {0}개".format(len(filtered_records)))
-
-                st.dataframe(
-                    filtered_records,
-                    column_order=("file_name", "category", "extension", "software_version", "description", "drive_link", "updated_at"),
-                    column_config={
-                        "file_name": st.column_config.TextColumn("파일명", width="medium"),
-                        "category": st.column_config.TextColumn("분류", width="small"),
-                        "extension": st.column_config.TextColumn("확장자", width="small"),
-                        "software_version": st.column_config.TextColumn("버전", width="small"),
-                        "description": st.column_config.TextColumn("상세 설명", width="large"),
-                        "drive_link": st.column_config.LinkColumn("다운로드", display_text="구글 드라이브 열기", width="small"),
-                        "updated_at": st.column_config.TextColumn("수정일", width="small"),
-                    },
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.info("현재 시트에 등록된 BIM 파일 데이터가 없습니다.")
-        except Exception as e:
-            st.error("카탈로그 데이터를 불러오는 중 오류가 발생했습니다: {0}".format(e))
-
-    # 탭 4: 관리자 전용 Vector DB 데이터 구조 및 3중 문서화 관리
-    with tab_inspector:
-        st.subheader("Vector DB(ChromaDB v3.2) 데이터 구조 검증 및 3중 문서화 관리")
-        st.caption("웹 서버를 켜지 않아도 언제든 확인 가능하도록 Google Sheets('VectorDB_관리대장' 탭), 통합 엑셀(.xlsx), 파일별 1:1 마크다운(.md) 명세서로 자동 문서화합니다.")
-
+    with r_col2:
         with st.container(border=True):
-            st.markdown("#### [Vector DB 3중 문서화 파일 생성 및 다운로드]")
-            col_doc_btn1, col_doc_btn2 = st.columns(2)
-            with col_doc_btn1:
-                if st.button("지금 즉시 3중 관리 문서(Sheets + Excel + 1:1 MD) 최신화 생성", use_container_width=True):
-                    with st.spinner("ChromaDB 데이터를 추출하여 Google Sheets, Excel, Markdown 파일을 생성 중입니다..."):
-                        col = get_collection()
-                        if col:
-                            export_vector_db_documentation(col, GOOGLE_KEY_PATH, SHEET_ID)
-                            st.success("생성 완료! 구글 시트 'VectorDB_관리대장' 탭 및 로컬 db_docs 폴더를 확인하세요.")
-            with col_doc_btn2:
-                if os.path.exists(EXCEL_REPORT_PATH):
-                    with open(EXCEL_REPORT_PATH, "rb") as ef:
-                        st.download_button(
-                            label="통합 엑셀 대장 다운로드 (VectorDB_통합관리대장.xlsx)",
-                            data=ef.read(),
-                            file_name="VectorDB_통합관리대장.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-                else:
-                    st.info("좌측 버튼을 누르거나 동기화를 실행하면 엑셀 대장 다운로드 버튼이 활성화됩니다.")
-            st.caption("1:1 마크다운 명세서 로컬 저장 경로: `{0}`".format(MD_SPECS_DIR))
-
-        summary_list, chunk_details = get_vector_db_status()
-
-        if not summary_list:
-            st.info("현재 Vector DB에 적재된 데이터가 없습니다.")
-        else:
-            total_docs = len(summary_list)
-            total_chunks = len(chunk_details)
-            total_chars = sum(c["char_length"] for c in chunk_details)
-            avg_chunk_len = round(total_chars / total_chunks) if total_chunks > 0 else 0
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("총 벡터화 문서 수", "{0}개".format(total_docs))
-            m2.metric("총 분할 조각(Chunk) 수", "{0}개".format(total_chunks))
-            m3.metric("조각당 평균 글자 수", "{0}자".format(avg_chunk_len))
-
-            st.divider()
-
-            st.markdown("**1. 문서별 4대 도메인 · 9대 표준 분류 및 드라이브 폴더 경로 현황**")
-            st.dataframe(
-                summary_list,
-                column_order=("domain_group", "doc_category", "folder_path", "file_name", "file_ext", "chunk_count", "avg_chars", "drive_link"),
-                column_config={
-                    "domain_group": st.column_config.TextColumn("상위 도메인", width="small"),
-                    "doc_category": st.column_config.TextColumn("9대 표준 분류", width="medium"),
-                    "folder_path": st.column_config.TextColumn("드라이브 폴더 경로", width="medium"),
-                    "file_name": st.column_config.TextColumn("문서명", width="large"),
-                    "file_ext": st.column_config.TextColumn("형식", width="small"),
-                    "chunk_count": st.column_config.NumberColumn("조각 수", width="small"),
-                    "avg_chars": st.column_config.NumberColumn("평균 글자 수", width="small"),
-                    "drive_link": st.column_config.LinkColumn("원본 파일", display_text="원본 열기", width="small"),
-                },
-                use_container_width=True,
-                hide_index=True
+            st.markdown("#### Revit 초기 세팅 코드(.py) 생성기")
+            st.caption("프로젝트 층고·그리드·뷰 세팅 요구사항을 입력하면 즉시 실행 가능한 Revit API 파이썬 코드를 생성합니다.")
+            script_req = st.text_area(
+                "레벨 및 그리드 세팅 조건 입력",
+                placeholder="예: 지하 2층(층고 4500mm) ~ 지상 5층(층고 4200mm) 레벨 및 8000mm 간격 그리드 자동 생성",
+                height=110
             )
-
-            st.divider()
-
-            st.markdown("**2. 문서 내부 분할 조각(Chunk) 상세 검증기**")
-            inspect_file = st.selectbox(
-                "상세 구조를 확인할 문서를 선택하세요",
-                options=["전체 조각 보기"] + [s["file_name"] for s in summary_list]
-            )
-
-            filtered_chunks = chunk_details if inspect_file == "전체 조각 보기" else [c for c in chunk_details if c["file_name"] == inspect_file]
-
-            st.dataframe(
-                filtered_chunks,
-                column_order=("doc_category", "folder_path", "setup_topic", "chunk_type", "file_name", "location", "char_length", "preview"),
-                column_config={
-                    "doc_category": st.column_config.TextColumn("표준 분류", width="small"),
-                    "folder_path": st.column_config.TextColumn("폴더 경로", width="small"),
-                    "setup_topic": st.column_config.TextColumn("세팅/활용 주제", width="medium"),
-                    "chunk_type": st.column_config.TextColumn("조각 유형", width="small"),
-                    "file_name": st.column_config.TextColumn("파일명", width="medium"),
-                    "location": st.column_config.TextColumn("추출 위치", width="small"),
-                    "char_length": st.column_config.NumberColumn("글자 수", width="small"),
-                    "preview": st.column_config.TextColumn("텍스트 미리보기 (앞 120자)", width="large"),
-                },
-                use_container_width=True,
-                hide_index=True
-            )
-
-            if filtered_chunks:
-                options_list = ["[{0}] ({1} / {2}자) - {3}".format(c['location'], c['setup_topic'], c['char_length'], c['file_name']) for c in filtered_chunks]
-                selected_loc = st.selectbox("전문(Full Text)을 확인할 조각 위치를 선택하세요", options=options_list)
-                target_idx = options_list.index(selected_loc)
-                st.text_area(
-                    "실제 Vector DB에 저장된 텍스트 원문 (상단 문맥 헤더 포함)",
-                    value=filtered_chunks[target_idx]["full_content"],
-                    height=220,
-                    disabled=True
-                )
+            if st.button("Revit 자동 세팅 코드(.py) 생성", type="primary", use_container_width=True):
+                if script_req.strip():
+                    with st.spinner("Revit API 트랜잭션 스크립트 작성 중..."):
+                        desc_out, py_out, _ = generate_revit_setup_script(script_req.strip())
+                    st.download_button(
+                        "Revit_Auto_Setup.py 다운로드",
+                        data=py_out.encode("utf-8-sig"),
+                        file_name="Revit_Auto_Setup.py",
+                        use_container_width=True
+                    )
+                    with st.expander("생성된 세팅 요약 및 파이썬 코드 보기", expanded=True):
+                        st.markdown(desc_out)
