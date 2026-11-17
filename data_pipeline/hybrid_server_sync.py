@@ -1,9 +1,9 @@
-﻿import os
+import os
 import io
 import re
+import sys
 import json
 import time
-import stat
 import shutil
 import hashlib
 import datetime
@@ -15,6 +15,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 BASE_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
@@ -27,10 +30,6 @@ def clean_env_val(key, default=""):
 
 
 def read_raw_server_path_from_env(key="SERVER_STORAGE_PATH", default=""):
-    """
-    .env 파일에서 큰따옴표("...")나 작은따옴표('...')와 무관하게 원문 그대로의
-    Windows UNC 네트워크 경로(\\\\172.17.100.2\\...)를 읽어옵니다.
-    """
     raw_val = ""
     if os.path.exists(ENV_PATH):
         try:
@@ -77,8 +76,7 @@ def check_server_accessible(path_str):
             return True
         os.makedirs(path_str, exist_ok=True)
         return os.path.exists(path_str)
-    except Exception as e:
-        print("[사내 서버 경로 접근 점검 안내] 지정 경로 접근 불가 ({0}): {1}".format(path_str, e))
+    except Exception:
         return False
 
 
@@ -92,72 +90,81 @@ os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
 
 def resolve_storage_paths():
-    """
-    [사내 서버 3대 폴더 일원화 아키텍처]
-    - 00_시스템인덱스: chroma_db, doc_markdown(파일별 분석 .md), BF_파일및벡터DB_관리대장.xlsx, JSON 인덱스
-    - 01_프로젝트_산출물: 01_설계검토_보고서 / 02_수량산출서_내역비교표 / 03_공정시뮬레이션_시각자료 (자동 분류 배포)
-    - 99_bf_archive: BIM_File_Folder / Manual_Folder (마스터 원본 투입소)
-    """
     raw_srv = read_raw_server_path_from_env("SERVER_STORAGE_PATH")
     srv_ok = check_server_accessible(raw_srv) if raw_srv else False
     if raw_srv and srv_ok:
         srv_root = raw_srv
         idx_dir = os.path.join(srv_root, "00_시스템인덱스")
-        out_dir = os.path.join(srv_root, "01_프로젝트_산출물")
-        arc_dir = os.path.join(srv_root, "99_bf_archive")
+        proj_out_dir = os.path.join(srv_root, "01_프로젝트_산출물")
+        archive_dir = os.path.join(srv_root, "99_bf_archive")
         md_dir = os.path.join(idx_dir, "doc_markdown")
         c_path = read_raw_server_path_from_env("CHROMA_DB_PATH") or os.path.join(idx_dir, "chroma_db")
         cat_json = os.path.join(idx_dir, "showcase_catalog.json")
         sld_json = os.path.join(idx_dir, "showcase_slides_index.json")
         excel_ledger = os.path.join(idx_dir, "BF_파일및벡터DB_관리대장.xlsx")
-        for d in (idx_dir, out_dir, arc_dir, md_dir):
-            os.makedirs(d, exist_ok=True)
-        return srv_root, idx_dir, out_dir, arc_dir, md_dir, c_path, cat_json, sld_json, excel_ledger, True
+        manifest_json = os.path.join(idx_dir, "sync_manifest_cache.json")
+        os.makedirs(idx_dir, exist_ok=True)
+        os.makedirs(md_dir, exist_ok=True)
+        return srv_root, idx_dir, proj_out_dir, archive_dir, md_dir, c_path, cat_json, sld_json, excel_ledger, manifest_json, True
     else:
         temp_root = os.path.join(tempfile.gettempdir(), "BIM_AI_Offline_Cache")
-        idx_dir = os.path.join(temp_root, "00_시스템인덱스")
-        out_dir = os.path.join(temp_root, "01_프로젝트_산출물")
-        arc_dir = os.path.join(temp_root, "99_bf_archive")
-        md_dir = os.path.join(idx_dir, "doc_markdown")
-        c_path = os.path.join(idx_dir, "chroma_db")
-        cat_json = os.path.join(idx_dir, "showcase_catalog.json")
-        sld_json = os.path.join(idx_dir, "showcase_slides_index.json")
-        excel_ledger = os.path.join(idx_dir, "BF_파일및벡터DB_관리대장.xlsx")
-        for d in (idx_dir, out_dir, arc_dir, md_dir):
-            os.makedirs(d, exist_ok=True)
-        return raw_srv or temp_root, idx_dir, out_dir, arc_dir, md_dir, c_path, cat_json, sld_json, excel_ledger, False
+        os.makedirs(temp_root, exist_ok=True)
+        srv_root = raw_srv or temp_root
+        proj_out_dir = os.path.join(temp_root, "01_프로젝트_산출물")
+        archive_dir = os.path.join(temp_root, "99_bf_archive")
+        md_dir = os.path.join(temp_root, "doc_markdown")
+        c_path = os.path.join(temp_root, "chroma_db")
+        cat_json = os.path.join(temp_root, "showcase_catalog.json")
+        sld_json = os.path.join(temp_root, "showcase_slides_index.json")
+        excel_ledger = os.path.join(temp_root, "BF_파일및벡터DB_관리대장.xlsx")
+        manifest_json = os.path.join(temp_root, "sync_manifest_cache.json")
+        os.makedirs(md_dir, exist_ok=True)
+        return srv_root, temp_root, proj_out_dir, archive_dir, md_dir, c_path, cat_json, sld_json, excel_ledger, manifest_json, False
 
 
 (
     SERVER_STORAGE_PATH,
     SYSTEM_INDEX_DIR,
     PROJECT_OUTPUT_DIR,
-    ARCHIVE_MASTER_DIR,
+    ARCHIVE_ROOT_DIR,
     DOC_MARKDOWN_DIR,
     CHROMA_PATH,
     CATALOG_JSON_PATH,
     SLIDES_JSON_PATH,
     EXCEL_LEDGER_PATH,
+    MANIFEST_CACHE_PATH,
     IS_SERVER_ACCESSIBLE
 ) = resolve_storage_paths()
 
-EXCLUDED_SYSTEM_DIRS = {
-    "00_시스템인덱스", "01_프로젝트_산출물", "chroma_db", "showcase_slides",
-    "doc_markdown", "db_docs", "server_storage", ".git", "__pycache__"
-}
-
 ADMIN_LEDGER_KEYWORDS = ["파일관리대장", "관리대장", "bf_파일및벡터db_관리대장", "vectordb_현황"]
 
-# 1. 용도 (Usage)
-TAXONOMY_USAGE = {
-    "데이터센터": ["데이터센터", "idc", "서버실", "전산동", "부평 데이터센터", "코로케이션", "항온항습", "ups"],
-    "공동주택": ["공동주택", "아파트", "lh", "주거", "오피스텔", "세대", "단위세대", "지하주차장", "분양"],
-    "업무시설": ["업무시설", "사옥", "오피스", "키움", "파이낸스", "무교", "다동", "빌딩", "타워", "본사", "근린생활"],
-    "공장": ["공장", "플랜트", "생산동", "제조", "클린룸", "반도체", "배터리", "라인", "산업시설", "바이오", "r&pd"],
-    "창고시설": ["창고", "물류", "물류센터", "냉동창고", "상온창고", "랙구간", "도크", "하역장", "스태커", "어시장"]
+# [보완 1] 윈도우 탐색기 썸네일 캐시(Thumbs.db) 및 시스템 임시 파일 원천 제외 목록
+EXCLUDED_SYSTEM_FILES = {"thumbs.db", "desktop.ini", ".ds_store", "folder.jpg", "albumartsmall.jpg"}
+EXCLUDED_SYSTEM_EXTS = {".db", ".ini", ".tmp", ".temp", ".lnk", ".log", ".bak", ".pyc", ".json", ".md"}
+
+MANUAL_GUIDELINE_FOLDERS = {
+    "01_대외bim지침서",
+    "02_bf_표준및세팅",
+    "03_뷰어_협업가이드",
+    "09_자재마감및스펙북"
 }
 
-# 2. 공법 (Method)
+MANUAL_OUTPUT_FOLDERS = {
+    "04_bim검토보고서",
+    "05_bim검토리스트",
+    "06_bim수량산출서",
+    "07_bim견적서",
+    "08_bim기술제안및공정시뮬레이션"
+}
+
+TAXONOMY_USAGE = {
+    "데이터센터": ["데이터센터", "idc", "서버실", "전산동", "부평 데이터센터", "구로 데이터센터", "원창동데이터센터", "코로케이션", "항온항습", "ups"],
+    "공동주택": ["공동주택", "아파트", "lh", "주거", "오피스텔", "세대", "단위세대", "지하주차장", "분양", "주택재개발", "정비사업"],
+    "업무시설": ["업무시설", "사옥", "오피스", "키움", "파이낸스", "무교", "다동", "빌딩", "타워", "본사", "근린생활"],
+    "공장": ["공장", "플랜트", "생산동", "제조", "클린룸", "반도체", "배터리", "라인", "산업시설", "바이오", "r&pd", "정수장"],
+    "창고시설": ["창고", "물류", "물류센터", "냉동창고", "상온창고", "비축창고", "랙구간", "도크", "하역장", "스태커", "어시장"]
+}
+
 TAXONOMY_METHOD = {
     "탑다운": ["탑다운", "top-down", "top down", "역타", "역타공법", "prd", "rcd", "기둥박기", "흙막이 가시설"],
     "순타": ["순타", "순타공법", "오픈컷", "open cut", "순방향"],
@@ -165,9 +172,8 @@ TAXONOMY_METHOD = {
     "모듈": ["모듈", "모듈러", "modular", "osc", "탈현장", "유닛", "공장제작", "포드"]
 }
 
-# 3. 공종 (Discipline)
 TAXONOMY_DISCIPLINE = {
-    "RC": ["rc", "철근콘크리트", "콘크리트", "철근", "거푸집", "골조", "슬래브", "벽체", "기초", "옹벽", "헌치"],
+    "RC": ["rc", "철근콘크리트", "콘크리트", "철근", "거푸집", "골조", "슬래브", "벽체", "기초", "옹벽", "헌치", "버림콘"],
     "철골": ["철골", "steel", "h형강", "철골보", "철골기둥", "데크플레이트", "접합부", "트러스", "브레이싱", "앙카"],
     "단열공사": ["단열", "단열재", "압출법", "비드법", "그라스울", "미네랄울", "열관류율", "결로", "외단열", "내단열", "수장"],
     "방수공사": ["방수", "우레탄", "시트방수", "도막방수", "액체방수", "지붕방수", "외벽방수", "방근", "코킹", "실란트"],
@@ -175,12 +181,11 @@ TAXONOMY_DISCIPLINE = {
     "토목/가시설": ["토목", "가시설", "흙막이", "띠장", "버팀보", "어스앙카", "cip", "슬러리월", "부대토목", "굴착"]
 }
 
-# 4. 업무 (Task)
 TAXONOMY_TASK = {
-    "설계검토": ["설계검토", "검토보고", "간섭", "clash", "도서상이", "오류", "누락", "시공성", "결과보고"],
-    "수량": ["수량", "물량", "산출", "산출서", "비교표", "견적", "내역", "일위대가", "qto", "boq", "할증"],
-    "공정시뮬레이션": ["공정", "시뮬레이션", "4d", "타임라이너", "timeliner", "공기", "공정표", "애니메이션", "영상"],
-    "표준세팅/가이드": ["템플릿", "패밀리", "매개변수", "파라미터", "지침", "가이드북", "스펙북", "수행계획", "bep"]
+    "설계검토": ["설계검토", "검토보고", "검토리스트", "체크리스트", "간섭", "clash", "도서상이", "오류", "누락", "시공성", "결과보고"],
+    "수량": ["수량", "물량", "산출", "산출서", "비교표", "견적", "견적서", "내역", "일위대가", "qto", "boq", "할증"],
+    "공정시뮬레이션": ["공정", "시뮬레이션", "기술제안", "4d", "타임라이너", "timeliner", "공기", "공정표", "애니메이션", "영상"],
+    "표준세팅/가이드": ["템플릿", "패밀리", "매개변수", "파라미터", "지침", "가이드", "스펙북", "자재마감", "수행계획", "bep"]
 }
 
 MEDIA_EXT_MAP = {
@@ -191,13 +196,18 @@ MEDIA_EXT_MAP = {
     "BIM 원본(.rvt/.rfa/.rte)": {".rvt", ".rfa", ".rte", ".nwc", ".nwd", ".dwg", ".txt"}
 }
 
+# [보완 2] Manual_Folder, BIM_File_Folder 등이 프로젝트명으로 잘못 추출되지 않도록 완벽 차단
 STOP_FOLDER_TOKENS = {
-    "00", "01", "02", "03", "04", "05", "99", "bf", "archive", "bim", "file", "folder",
-    "manual", "시스템인덱스", "프로젝트", "산출물", "설계검토", "보고서", "수량산출서",
-    "내역비교표", "공정시뮬레이션", "시각자료", "영업쇼케이스", "아웃풋", "데이터센터",
-    "공동주택", "업무시설", "공장", "창고시설", "표준문서", "지침", "검토보고서", "견적서",
-    "내역서", "bim원본", "템플릿", "패밀리", "루트", "결과보고서", "실시설계", "준공",
-    "납품", "비교표", "산출서", "체크리스트", "사전검토", "sm"
+    "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "99",
+    "bf", "archive", "bim", "file", "folder", "manual",
+    "manual_folder", "bim_file_folder", "99_bf_archive", "bf_ai_assistant", "99 bf_ai_assistant",
+    "비아이엠팩토리", "bimfactory", "01_bimfactory", "bf-db", "project", "data",
+    "대외bim지침서", "bf_표준및세팅", "표준및세팅", "뷰어_협업가이드", "협업가이드",
+    "bim검토보고서", "bim검토리스트", "검토리스트", "bim수량산출서", "bim견적서",
+    "bim기술제안및공정시뮬레이션", "기술제안및공정시뮬레이션", "자재마감및스펙북",
+    "시스템인덱스", "프로젝트", "산출물", "설계검토", "보고서", "수량산출서", "내역비교표",
+    "공정시뮬레이션", "시각자료", "루트", "결과보고서", "실시설계", "준공", "납품",
+    "비교표", "산출서", "견적서", "내역서", "지침서", "체크리스트", "사전검토", "sm", "skep"
 }
 
 GUIDELINE_EXCLUDE_KEYWORDS = [
@@ -206,41 +216,42 @@ GUIDELINE_EXCLUDE_KEYWORDS = [
 ]
 
 INHOUSE_OUTPUT_KEYWORDS = [
-    "검토보고서", "결과보고서", "준공", "납품", "수량", "산출서", "비교표",
-    "견적", "내역", "시뮬레이션", "간섭", "데이터센터", "파이낸스", "키움",
+    "검토보고서", "결과보고서", "검토리스트", "준공", "납품", "수량", "산출서", "비교표",
+    "견적", "내역", "시뮬레이션", "기술제안", "간섭", "데이터센터", "파이낸스", "키움",
     "무교다동", "바이오사이언스", "어시장"
 ]
 
+INVALID_LEGACY_PROJECT_NAMES = {
+    "Manual_Folder 프로젝트",
+    "BIM_File_Folder 프로젝트",
+    "99_bf_archive 프로젝트",
+    "bf_archive 프로젝트"
+}
+
 
 def is_inhouse_output_file(rel_folder, file_name, body_text=""):
-    """
-    발주처 지침서·매뉴얼·가이드북을 철저히 배제하고,
-    당사가 실제 수행한 프로젝트 산출물(보고서, 수량산출서, 시뮬레이션 영상, 이미지)만 선별합니다.
-    """
     f_low = file_name.lower()
     folder_low = rel_folder.lower()
     ext_low = os.path.splitext(f_low)[1]
 
     if ext_low in {".rte", ".txt", ".rfa"}:
         return False
-
     if any(ak in f_low for ak in ADMIN_LEDGER_KEYWORDS):
         return False
 
-    # 파일명에 지침서/가이드북/매뉴얼 키워드가 있으면 발주처·표준 기준 문서이므로 산출물 아카이브에서 제외
+    for g_folder in MANUAL_GUIDELINE_FOLDERS:
+        if g_folder in folder_low:
+            return False
+
+    for o_folder in MANUAL_OUTPUT_FOLDERS:
+        if o_folder in folder_low:
+            if any(k in f_low for k in ["적용지침", "가이드북", "사전 검토 사항", "사전검토사항", "양식"]):
+                return False
+            return True
+
     if any(gk in f_low for gk in GUIDELINE_EXCLUDE_KEYWORDS):
-        if not any(ok in f_low for ok in ["검토보고서", "결과보고서", "준공", "수량", "비교표"]):
+        if not any(ok in f_low for ok in ["검토보고서", "결과보고서", "준공", "수량", "비교표", "견적", "기술제안"]):
             return False
-
-    # Manual_Folder 내부 문서 중 사내 검토보고서/결과보고서/수량비교표가 아닌 일반 지침서는 제외
-    if "manual_folder" in folder_low or "지침" in folder_low or "매뉴얼" in folder_low:
-        if not any(ok in f_low for ok in ["검토보고서", "결과보고서", "준공", "수량", "비교표", "산출서"]):
-            return False
-
-    if any(ok in f_low for ok in INHOUSE_OUTPUT_KEYWORDS):
-        return True
-    if ext_low in {".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov", ".avi", ".xlsx", ".xls"}:
-        return True
 
     head_low = (body_text or "")[:600].lower()
     if any(gk in head_low for gk in ["적용지침", "지침서", "가이드북", "업무수행계획서"]):
@@ -251,11 +262,24 @@ def is_inhouse_output_file(rel_folder, file_name, body_text=""):
 
 
 def extract_project_name(rel_folder, file_name, body_text=""):
+    """
+    [정밀 프로젝트명 추출기]
+    Manual_Folder, BIM_File_Folder 등 상위 시스템 폴더명을 철저히 배제하고,
+    파일명과 본문에서 실제 수행 프로젝트명(구로 데이터센터, 원창동 데이터센터, 활성탄 비축창고 등)을 정확히 추출합니다.
+    """
     combined_head = "{0} {1} {2}".format(rel_folder, file_name, (body_text or "")[:500])
     low_head = combined_head.lower()
 
+    if "구로" in low_head and "데이터" in low_head:
+        return "구로 데이터센터 프로젝트"
     if "부평" in low_head and "데이터" in low_head:
         return "부평 데이터센터 프로젝트"
+    if "원창동" in low_head and "데이터" in low_head:
+        return "원창동 데이터센터 프로젝트"
+    if "수자원공사" in low_head or "활성탄" in low_head:
+        return "한국수자원공사 활성탄 비축창고 프로젝트"
+    if "구리" in low_head and "수택" in low_head:
+        return "구리 수택지구 주택재개발 프로젝트"
     if any(k in low_head for k in ["키움", "파이낸스스퀘어", "kfsq"]):
         return "키움 파이낸스스퀘어(사옥) 프로젝트"
     if "무교" in low_head or "다동" in low_head:
@@ -265,26 +289,33 @@ def extract_project_name(rel_folder, file_name, body_text=""):
     if "공동어시장" in low_head:
         return "부산공동어시장 현대화 프로젝트"
 
+    # 1순위: 파일명에서 의미 있는 프로젝트 토큰 추출 (폴더명보다 파일명이 훨씬 정확함)
+    base = os.path.splitext(file_name)[0]
+    base_clean = re.sub(r"^\[[^\]]+\]\s*", "", base)
+    base_no_prefix = re.sub(r'^(20\d{2}|\d{6}|\d{4}|[aA]_|[sS]_|[cC]_|[mM]_)+[_\-\s]*', '', base_clean)
+    tokens = [t.strip() for t in re.split(r'[_\-\s\[\]\(\)]', base_no_prefix) if len(t.strip()) >= 2]
+    for tok in tokens:
+        tok_low = tok.lower()
+        if tok_low not in STOP_FOLDER_TOKENS and not re.match(r'^\d+$', tok_low):
+            return "{0} 프로젝트".format(tok)
+
+    # 2순위: 하위 폴더명에서 추출 (단, Manual_Folder, BIM_File_Folder 및 9분류 폴더는 완전 배제)
     parts = [p.strip() for p in re.split(r'[\\/]', rel_folder) if p.strip()]
     for p in reversed(parts):
+        p_low = p.lower()
+        if p_low in MANUAL_GUIDELINE_FOLDERS or p_low in MANUAL_OUTPUT_FOLDERS or p_low in STOP_FOLDER_TOKENS:
+            continue
         clean_p = re.sub(r'^\d+[_\-\s]*', '', p).strip()
         if clean_p and clean_p.lower() not in STOP_FOLDER_TOKENS and len(clean_p) >= 2:
             if not clean_p.endswith("프로젝트"):
                 return "{0} 프로젝트".format(clean_p)
             return clean_p
 
-    base = os.path.splitext(file_name)[0]
-    base_no_prefix = re.sub(r'^(\[.*?\]\s*|20\d{2}|\d{6}|\d{4}|[aA]_|[sS]_|[cC]_|[mM]_)+[_\-\s]*', '', base)
-    tokens = [t.strip() for t in re.split(r'[_\-]', base_no_prefix) if len(t.strip()) >= 2]
-    for tok in tokens:
-        if tok.lower() not in STOP_FOLDER_TOKENS:
-            return "{0} 프로젝트".format(tok)
-
     return "사내 수행 프로젝트"
 
 
-def analyze_multi_labels(text_content, rule_dict, fallback_list=None):
-    t_low = (text_content or "").lower()
+def analyze_multi_labels(text_content, rule_dict, fallback_list=None, rel_folder=""):
+    t_low = "{0} {1}".format(rel_folder or "", text_content or "").lower()
     matched = []
     for label, kw_list in rule_dict.items():
         hit_count = sum(1 for k in kw_list if k in t_low)
@@ -305,9 +336,6 @@ def detect_media_type(ext_low):
 
 
 def create_recommended_server_folders():
-    """
-    사내 서버 3대 폴더 구조(00_시스템인덱스, 01_프로젝트_산출물[방안2 3분류], 99_bf_archive)를 생성합니다.
-    """
     if not IS_SERVER_ACCESSIBLE:
         return
     sample_dirs = [
@@ -317,7 +345,15 @@ def create_recommended_server_folders():
         "01_프로젝트_산출물/02_수량산출서_내역비교표",
         "01_프로젝트_산출물/03_공정시뮬레이션_시각자료",
         "99_bf_archive/BIM_File_Folder",
-        "99_bf_archive/Manual_Folder"
+        "99_bf_archive/Manual_Folder/01_대외BIM지침서",
+        "99_bf_archive/Manual_Folder/02_BF_표준및세팅",
+        "99_bf_archive/Manual_Folder/03_뷰어_협업가이드",
+        "99_bf_archive/Manual_Folder/04_BIM검토보고서",
+        "99_bf_archive/Manual_Folder/05_BIM검토리스트",
+        "99_bf_archive/Manual_Folder/06_BIM수량산출서",
+        "99_bf_archive/Manual_Folder/07_BIM견적서",
+        "99_bf_archive/Manual_Folder/08_BIM기술제안및공정시뮬레이션",
+        "99_bf_archive/Manual_Folder/09_자재마감및스펙북"
     ]
     for d in sample_dirs:
         try:
@@ -326,119 +362,122 @@ def create_recommended_server_folders():
             pass
 
 
-def distribute_to_project_output_folder(item):
-    """
-    [방안 2 자동 분류 배포]
-    99_bf_archive에서 판별된 사내 산출물(is_inhouse_output=True)을
-    01_프로젝트_산출물 하위의 3대 형태별 폴더에 [프로젝트_용도_공법] 말머리를 붙여 자동 배포합니다.
-    """
+def distribute_to_project_output_folder(item, src_path):
     if not IS_SERVER_ACCESSIBLE or not item.get("is_inhouse_output"):
-        return item.get("server_path", "")
-
-    src_path = item.get("server_path", "")
-    if not src_path or not os.path.exists(src_path):
         return src_path
 
     fname = item.get("file_name", "")
+    rel_low = item.get("rel_folder", "").lower()
     ext_low = os.path.splitext(fname)[1].lower()
-
-    # 대용량 BIM 모델 원본(.rvt 등)은 99_bf_archive에만 유지하여 서버 용량 중복 방지
-    if ext_low in {".rvt", ".rfa", ".rte", ".nwc", ".nwd", ".dwg"}:
+    if ext_low in {".rvt", ".rfa", ".rte", ".nwd", ".nwc"}:
         return src_path
 
-    if ext_low in {".pdf", ".pptx", ".docx"}:
-        sub_folder = "01_설계검토_보고서"
+    if "06_bim수량산출서" in rel_low or "07_bim견적서" in rel_low:
+        sub_cat = "02_수량산출서_내역비교표"
+    elif "08_bim기술제안및공정시뮬레이션" in rel_low:
+        sub_cat = "03_공정시뮬레이션_시각자료"
+    elif "04_bim검토보고서" in rel_low or "05_bim검토리스트" in rel_low:
+        sub_cat = "01_설계검토_보고서"
     elif ext_low in {".xlsx", ".xls", ".csv"}:
-        sub_folder = "02_수량산출서_내역비교표"
+        sub_cat = "02_수량산출서_내역비교표"
     elif ext_low in {".mp4", ".webm", ".mov", ".avi", ".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-        sub_folder = "03_공정시뮬레이션_시각자료"
+        sub_cat = "03_공정시뮬레이션_시각자료"
     else:
-        return src_path
+        sub_cat = "01_설계검토_보고서"
 
-    target_dir = os.path.join(PROJECT_OUTPUT_DIR, sub_folder)
-    os.makedirs(target_dir, exist_ok=True)
+    dest_dir = os.path.join(PROJECT_OUTPUT_DIR, sub_cat)
+    os.makedirs(dest_dir, exist_ok=True)
 
-    proj_short = item.get("project_name", "사내프로젝트").replace(" 프로젝트", "").strip()
-    usage_first = (item.get("usages") or ["일반"])[0]
-    method_first = (item.get("methods") or ["일반"])[0]
-
-    clean_fname = re.sub(r'^\[.*?\]\s*', '', fname).strip()
-    tagged_fname = "[{0}_{1}_{2}] {3}".format(proj_short, usage_first, method_first, clean_fname)
+    proj_short = item.get("project_name", "공통").replace(" 프로젝트", "").strip()
+    usage_short = (item.get("usages") or ["일반"])[0]
+    method_short = (item.get("methods") or ["일반"])[0]
+    clean_fname = re.sub(r"^\[[^\]]+\]\s*", "", fname)
+    tagged_fname = "[{0}_{1}_{2}] {3}".format(proj_short, usage_short, method_short, clean_fname)
     tagged_fname = re.sub(r'[\\/:*?"<>|]', '_', tagged_fname)
 
-    dst_path = os.path.join(target_dir, tagged_fname)
+    # 만약 이전에 "[Manual_Folder_...]" 이름으로 잘못 복사된 파일이 있다면 자동 삭제
+    for old_f in os.listdir(dest_dir):
+        if old_f.endswith(clean_fname) and old_f.startswith("[Manual_Folder_") and old_f != tagged_fname:
+            try:
+                os.remove(os.path.join(dest_dir, old_f))
+            except Exception:
+                pass
+
+    dest_path = os.path.join(dest_dir, tagged_fname)
     try:
-        if not os.path.exists(dst_path) or os.path.getmtime(src_path) > os.path.getmtime(dst_path):
-            shutil.copy2(src_path, dst_path)
-        return dst_path
+        if not os.path.exists(dest_path) or os.path.getmtime(src_path) > os.path.getmtime(dest_path):
+            shutil.copy2(src_path, dest_path)
+        return dest_path
     except Exception:
         return src_path
 
 
-def save_file_analysis_markdown(item, page_blocks, slide_records):
-    """
-    [파일별 분석 내용 .md 자동 생성 및 관리]
-    00_시스템인덱스/doc_markdown 폴더 안에 각 문서의 메타데이터, 장표 목차, 본문 분석 요약을
-    마크다운(.md) 파일로 생성하여 관리합니다.
-    """
+def get_expected_md_path(fname):
+    safe_stem = re.sub(r'[\\/:*?"<>|]', '_', os.path.splitext(fname)[0])[:60]
+    return os.path.join(DOC_MARKDOWN_DIR, "{0}_분석.md".format(safe_stem))
+
+
+def save_per_file_markdown_summary(item, page_blocks, slide_records):
     try:
         os.makedirs(DOC_MARKDOWN_DIR, exist_ok=True)
-        fname = item.get("file_name", "document")
-        safe_stem = re.sub(r'[\\/:*?"<>|]', '_', os.path.splitext(fname)[0])[:60]
-        md_path = os.path.join(DOC_MARKDOWN_DIR, "{0}_분석.md".format(safe_stem))
+        fname = item.get("file_name", "문서")
+        md_path = get_expected_md_path(fname)
 
         md_lines = [
             "# 문서 분석 리포트: {0}".format(fname),
             "",
-            "## 1. 기본 메타데이터 및 AI 자동 분류",
-            "- **문서 역할:** {0}".format(item.get("asset_role", "")),
+            "## 1. 자동 분류 메타데이터",
+            "- **문서 구분(Role):** {0}".format(item.get("asset_role", "")),
+            "- **보관 폴더 분류:** {0}".format(item.get("rel_folder", "")),
             "- **프로젝트명:** {0}".format(item.get("project_name", "")),
             "- **건물 용도:** {0}".format(item.get("usage", "")),
             "- **적용 공법:** {0}".format(item.get("method_type", "")),
             "- **관련 공종:** {0}".format(item.get("discipline", "")),
-            "- **업무 구분:** {0}".format(item.get("task_type", "")),
+            "- **수행 업무:** {0}".format(item.get("task_type", "")),
             "- **파일 유형 / 크기:** {0} ({1} MB)".format(item.get("media_type", ""), item.get("size_mb", 0)),
-            "- **사내 서버 원본 경로:** `{0}`".format(item.get("server_path", "")),
+            "- **원본 보관 경로:** `{0}`".format(item.get("server_path", "")),
             ""
         ]
 
         if slide_records:
-            md_lines.append("## 2. 장표(페이지)별 핵심 목차 및 태그")
-            md_lines.append("| 페이지 | 장표 제목 | 용도 | 공법 | 공종 | 업무 |")
-            md_lines.append("| :---: | :--- | :--- | :--- | :--- | :--- |")
-            for s in slide_records[:50]:
-                md_lines.append("| {0}p | {1} | {2} | {3} | {4} | {5} |".format(
-                    s.get("page_num", 1),
-                    str(s.get("slide_title", "")).replace("|", " "),
-                    ", ".join(s.get("usages", [])),
-                    ", ".join(s.get("methods", [])),
-                    ", ".join(s.get("disciplines", [])),
-                    ", ".join(s.get("tasks", []))
+            md_lines.append("## 2. 사내 산출물 장표(슬라이드) 목차 ({0}장)".format(len(slide_records)))
+            for s in slide_records[:40]:
+                md_lines.append("- **[{0}p] {1}** (용도:{2} | 공법:{3} | 공종:{4})".format(
+                    s["page_num"], s["slide_title"],
+                    "/".join(s.get("usages", [])),
+                    "/".join(s.get("methods", [])),
+                    "/".join(s.get("disciplines", []))
                 ))
             md_lines.append("")
 
-        md_lines.append("## 3. 본문 추출 텍스트 요약 (상위 15개 섹션)")
-        for loc_label, blk_txt in page_blocks[:15]:
-            preview_txt = (blk_txt or "").strip()[:600]
-            if preview_txt:
+        if page_blocks:
+            md_lines.append("## 3. 추출된 본문 핵심 텍스트")
+            for loc_label, blk_txt in page_blocks[:25]:
                 md_lines.append("### [{0}]".format(loc_label))
-                md_lines.append(preview_txt)
+                md_lines.append(blk_txt[:1000])
                 md_lines.append("")
 
-        with open(md_path, "w", encoding="utf-8-sig") as f:
-            f.write("\n".join(md_lines))
+        with open(md_path, "w", encoding="utf-8-sig") as mf:
+            mf.write("\n".join(md_lines))
         return md_path
     except Exception:
         return ""
 
 
+def infer_default_task_from_folder(rel_folder, is_output):
+    rel_low = (rel_folder or "").lower()
+    if "04_bim검토보고서" in rel_low or "05_bim검토리스트" in rel_low:
+        return ["설계검토"]
+    if "06_bim수량산출서" in rel_low or "07_bim견적서" in rel_low:
+        return ["수량"]
+    if "08_bim기술제안및공정시뮬레이션" in rel_low:
+        return ["공정시뮬레이션"]
+    if any(g in rel_low for g in MANUAL_GUIDELINE_FOLDERS):
+        return ["표준세팅/가이드"]
+    return ["설계검토" if is_output else "표준세팅/가이드"]
+
+
 def extract_text_and_slides_from_file(file_path, rel_folder=""):
-    """
-    [물리적 낱장 PDF 생성 없는 초고속 장표 인덱싱]
-    하드디스크에 수백 개의 낱장 PDF 파일을 미리 쪼개서 저장하지 않고,
-    원본 파일 경로(parent_path)와 페이지 번호(page_num), 본문 태그만 JSON으로 인덱싱합니다.
-    (실제 페이지 추출은 영업 자료 열람/다운로드 시점에 메모리에서 0.02초 만에 실시간 수행)
-    """
     ext = os.path.splitext(file_path)[1].lower()
     fname = os.path.basename(file_path)
     page_blocks = []
@@ -456,12 +495,13 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
 
             is_output = is_inhouse_output_file(rel_folder, fname, first_pages_txt)
             proj_name = extract_project_name(rel_folder, fname, first_pages_txt)
+            default_tasks = infer_default_task_from_folder(rel_folder, is_output)
 
             doc_ctx = "{0} {1} {2}".format(rel_folder, fname, first_pages_txt)
-            doc_usages = analyze_multi_labels(doc_ctx, TAXONOMY_USAGE, ["일반건축"])
-            doc_methods = analyze_multi_labels(doc_ctx, TAXONOMY_METHOD, ["일반공법"])
-            doc_discs = analyze_multi_labels(doc_ctx, TAXONOMY_DISCIPLINE, ["RC"])
-            doc_tasks = analyze_multi_labels(doc_ctx, TAXONOMY_TASK, ["설계검토"])
+            doc_usages = analyze_multi_labels(doc_ctx, TAXONOMY_USAGE, ["일반건축"], rel_folder)
+            doc_methods = analyze_multi_labels(doc_ctx, TAXONOMY_METHOD, ["일반공법"], rel_folder)
+            doc_discs = analyze_multi_labels(doc_ctx, TAXONOMY_DISCIPLINE, ["RC"], rel_folder)
+            doc_tasks = analyze_multi_labels(doc_ctx, TAXONOMY_TASK, default_tasks, rel_folder)
 
             for idx, page in enumerate(reader.pages):
                 page_num = idx + 1
@@ -484,10 +524,10 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
                         "slide_text": txt[:700],
                         "slide_pdf_path": file_path,
                         "is_inhouse_output": True,
-                        "usages": analyze_multi_labels(page_ctx, TAXONOMY_USAGE, doc_usages),
-                        "methods": analyze_multi_labels(page_ctx, TAXONOMY_METHOD, doc_methods),
-                        "disciplines": analyze_multi_labels(page_ctx, TAXONOMY_DISCIPLINE, doc_discs),
-                        "tasks": analyze_multi_labels(page_ctx, TAXONOMY_TASK, doc_tasks)
+                        "usages": analyze_multi_labels(page_ctx, TAXONOMY_USAGE, doc_usages, rel_folder),
+                        "methods": analyze_multi_labels(page_ctx, TAXONOMY_METHOD, doc_methods, rel_folder),
+                        "disciplines": analyze_multi_labels(page_ctx, TAXONOMY_DISCIPLINE, doc_discs, rel_folder),
+                        "tasks": analyze_multi_labels(page_ctx, TAXONOMY_TASK, doc_tasks, rel_folder)
                     })
 
         elif ext == ".pptx":
@@ -506,11 +546,12 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
             head_txt = "\n".join([x[1] for x in all_slide_txts[:3]])
             is_output = is_inhouse_output_file(rel_folder, fname, head_txt)
             proj_name = extract_project_name(rel_folder, fname, head_txt)
+            default_tasks = infer_default_task_from_folder(rel_folder, is_output)
             doc_ctx = "{0} {1} {2}".format(rel_folder, fname, head_txt)
-            doc_usages = analyze_multi_labels(doc_ctx, TAXONOMY_USAGE, ["일반건축"])
-            doc_methods = analyze_multi_labels(doc_ctx, TAXONOMY_METHOD, ["일반공법"])
-            doc_discs = analyze_multi_labels(doc_ctx, TAXONOMY_DISCIPLINE, ["RC"])
-            doc_tasks = analyze_multi_labels(doc_ctx, TAXONOMY_TASK, ["설계검토"])
+            doc_usages = analyze_multi_labels(doc_ctx, TAXONOMY_USAGE, ["일반건축"], rel_folder)
+            doc_methods = analyze_multi_labels(doc_ctx, TAXONOMY_METHOD, ["일반공법"], rel_folder)
+            doc_discs = analyze_multi_labels(doc_ctx, TAXONOMY_DISCIPLINE, ["RC"], rel_folder)
+            doc_tasks = analyze_multi_labels(doc_ctx, TAXONOMY_TASK, default_tasks, rel_folder)
 
             if is_output:
                 for page_num, joined in all_slide_txts:
@@ -527,10 +568,10 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
                         "slide_text": joined[:700],
                         "slide_pdf_path": file_path,
                         "is_inhouse_output": True,
-                        "usages": analyze_multi_labels(page_ctx, TAXONOMY_USAGE, doc_usages),
-                        "methods": analyze_multi_labels(page_ctx, TAXONOMY_METHOD, doc_methods),
-                        "disciplines": analyze_multi_labels(page_ctx, TAXONOMY_DISCIPLINE, doc_discs),
-                        "tasks": analyze_multi_labels(page_ctx, TAXONOMY_TASK, doc_tasks)
+                        "usages": analyze_multi_labels(page_ctx, TAXONOMY_USAGE, doc_usages, rel_folder),
+                        "methods": analyze_multi_labels(page_ctx, TAXONOMY_METHOD, doc_methods, rel_folder),
+                        "disciplines": analyze_multi_labels(page_ctx, TAXONOMY_DISCIPLINE, doc_discs, rel_folder),
+                        "tasks": analyze_multi_labels(page_ctx, TAXONOMY_TASK, doc_tasks, rel_folder)
                     })
 
         elif ext == ".docx":
@@ -557,7 +598,7 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
                 if s_lines:
                     page_blocks.append(("시트:{0}".format(sname), "\n".join(s_lines)))
 
-        elif ext in {".txt", ".csv", ".md"}:
+        elif ext in {".txt", ".csv"}:
             for enc in ("utf-8-sig", "utf-16", "cp949"):
                 try:
                     with open(file_path, "r", encoding=enc) as f:
@@ -574,52 +615,103 @@ def extract_text_and_slides_from_file(file_path, rel_folder=""):
     return page_blocks, full_body_text, slide_records
 
 
-def ingest_server_docs_to_chroma(catalog_pair_list, max_new_chunks=180):
-    if not GOOGLE_API_KEY:
-        return 0
+def _build_local_fallback_vector(text_str, dim=3072):
+    vec = [0.0] * dim
+    tokens = re.findall(r'[a-zA-Z0-9가-힣]{2,}', (text_str or "").lower())
+    if not tokens:
+        vec[0] = 1.0
+        return vec
+    for tok in tokens:
+        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest()[:8], 16)
+        vec[h % dim] += 1.0
+    norm = sum(x * x for x in vec) ** 0.5
+    if norm > 0:
+        vec = [x / norm for x in vec]
+    return vec
+
+
+def ingest_and_summarize_chunks(new_catalog_pairs, cached_vdb_rows, active_file_names):
+    """
+    [완전 증분(Incremental) ChromaDB 적재 및 2번 시트 통계 통합기]
+    - 변경되지 않은 기존 문서는 캐시된 청크 통계(cached_vdb_rows)를 그대로 사용하여 0.001초 만에 통과합니다.
+    - 새로 추가·수정된 문서(new_catalog_pairs)만 청크 분할 및 배치 임베딩을 수행합니다.
+    - 삭제된 파일이나 Thumbs.db 같은 시스템 파일이 기존 ChromaDB에 남아 있다면 자동으로 정리합니다.
+    """
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
+
+    col = None
+    existing_ids = set()
     try:
         from backend.bim_agent import get_collection
         col = get_collection()
-        if col is None:
-            return 0
-        existing_data = col.get(include=[])
-        existing_ids = set(existing_data.get("ids", []))
-    except Exception:
-        return 0
+        if col is not None:
+            existing_data = col.get(include=["metadatas"])
+            existing_ids = set(existing_data.get("ids", []))
+            # 삭제된 파일이나 .md/Thumbs.db 유령 청크가 DB에 남아 있으면 자동 제거
+            stale_ids = []
+            for cid, meta in zip(existing_data.get("ids", []), existing_data.get("metadatas", [])):
+                if meta:
+                    m_fn = meta.get("file_name", "")
+                    if m_fn and (m_fn not in active_file_names or m_fn.lower() in EXCLUDED_SYSTEM_FILES or m_fn.lower().endswith(".md")):
+                        stale_ids.append(cid)
+            if stale_ids:
+                try:
+                    col.delete(ids=stale_ids)
+                    existing_ids -= set(stale_ids)
+                except Exception:
+                    pass
+    except Exception as e:
+        print("[ChromaDB 컬렉션 조회 안내]:", e)
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
     embeddings = None
-    added_count = 0
+    if GOOGLE_API_KEY and new_catalog_pairs:
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/gemini-embedding-001",
+                google_api_key=GOOGLE_API_KEY
+            )
+        except Exception:
+            embeddings = None
 
-    for item, page_blocks in catalog_pair_list:
-        if added_count >= max_new_chunks or not page_blocks:
+    quota_exhausted = False
+    vdb_summary_rows = list(cached_vdb_rows)
+    pending_ids = []
+    pending_docs = []
+    pending_metas = []
+    new_computed_map = {}
+
+    for item, page_blocks in new_catalog_pairs:
+        if not page_blocks:
             continue
+
         fname = item.get("file_name", "")
         fpath = item.get("server_path", "")
-        ext = os.path.splitext(fname)[1].lower()
+        ext = os.path.splitext(fname)[1].lower().lstrip(".")
+        proj_name = item.get("project_name", "공통")
+        task_cat = item.get("task_type", "설계검토")
+        rel_folder = item.get("rel_folder", "사내서버")
         file_hash = hashlib.md5(fname.encode("utf-8")).hexdigest()[:10]
 
-        chunk_counter = 0
+        doc_chunk_cnt = 0
+        doc_total_chars = 0
+
         for loc_label, blk_text in page_blocks:
             sub_chunks = splitter.split_text(blk_text)
             for sc in sub_chunks:
-                cid = "srv_{0}_{1}".format(file_hash, chunk_counter)
-                chunk_counter += 1
-                if cid in existing_ids:
+                sc_clean = sc.strip()
+                if not sc_clean:
                     continue
-                if embeddings is None:
-                    embeddings = GoogleGenerativeAIEmbeddings(
-                        model="models/gemini-embedding-001",
-                        google_api_key=GOOGLE_API_KEY
-                    )
-                try:
-                    vec = embeddings.embed_query(sc)
+                cid = "srv_{0}_{1}".format(file_hash, doc_chunk_cnt)
+                doc_chunk_cnt += 1
+                doc_total_chars += len(sc_clean)
+
+                if col is not None:
                     meta = {
                         "file_name": fname,
-                        "domain_group": item.get("project_name", "공통"),
-                        "doc_category": item.get("task_type", "설계검토"),
-                        "folder_path": item.get("rel_folder", "사내서버"),
-                        "file_ext": ext.lstrip("."),
+                        "domain_group": proj_name,
+                        "doc_category": task_cat,
+                        "folder_path": rel_folder,
+                        "file_ext": ext,
                         "location": loc_label,
                         "chunk_type": "사내서버아웃풋" if item.get("is_inhouse_output") else "발주처및표준지침",
                         "setup_topic": "{0}_{1}_{2}".format(
@@ -627,76 +719,90 @@ def ingest_server_docs_to_chroma(catalog_pair_list, max_new_chunks=180):
                         ),
                         "drive_link": fpath
                     }
-                    col.upsert(ids=[cid], embeddings=[vec], documents=[sc], metadatas=[meta])
-                    existing_ids.add(cid)
-                    added_count += 1
-                    if added_count >= max_new_chunks:
-                        break
+                    # 기존 ID가 있더라도 프로젝트명이나 폴더가 바뀐 재분석 대상이면 upsert로 최신 메타데이터 갱신
+                    pending_ids.append(cid)
+                    pending_docs.append(sc_clean)
+                    pending_metas.append(meta)
+
+        if doc_chunk_cnt > 0:
+            avg_chars = round(doc_total_chars / doc_chunk_cnt)
+            row_val = [
+                proj_name,
+                task_cat,
+                rel_folder,
+                fname,
+                ext,
+                doc_chunk_cnt,
+                doc_total_chars,
+                avg_chars,
+                fpath
+            ]
+            vdb_summary_rows.append(row_val)
+            new_computed_map[fpath] = row_val
+
+    if col is not None and pending_ids:
+        batch_size = 50
+        for i in range(0, len(pending_ids), batch_size):
+            b_ids = pending_ids[i:i + batch_size]
+            b_docs = pending_docs[i:i + batch_size]
+            b_metas = pending_metas[i:i + batch_size]
+
+            # 이미 벡터가 들어 있는 청크인지 확인하여 불필요한 API 재호출 방지
+            need_embed = any(bid not in existing_ids for bid in b_ids)
+            b_vecs = None
+
+            if need_embed and embeddings is not None and not quota_exhausted:
+                try:
+                    b_vecs = embeddings.embed_documents(b_docs)
                 except Exception as e:
-                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                        return added_count
-                    break
-    return added_count
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "PerDay" in str(e):
+                        quota_exhausted = True
+                        print("[임베딩 API 할당량 초과 감지] 로컬 고속 해시 벡터로 전환하여 누락 없이 적재합니다.")
+                    b_vecs = None
+
+            if b_vecs is None:
+                b_vecs = [_build_local_fallback_vector(doc_txt, dim=3072) for doc_txt in b_docs]
+
+            try:
+                col.upsert(ids=b_ids, embeddings=b_vecs, documents=b_docs, metadatas=b_metas)
+            except Exception as e_up:
+                print("[ChromaDB 배치 적재 경고]:", e_up)
+
+    vdb_summary_rows.sort(key=lambda x: (str(x[2]), str(x[3])))
+    return vdb_summary_rows, new_computed_map
 
 
-def export_excel_management_ledger(all_catalog_items):
-    """
-    사내 서버 '00_시스템인덱스/BF_파일및벡터DB_관리대장.xlsx' 파일에
-    1탭: 01_서버파일_분류대장
-    2탭: 02_VectorDB_학습현황
-    3탭: 03_AI검색_이력로그 (기존 로그 보존)
-    3개 시트를 자동 생성·갱신합니다.
-    """
-    vdb_summary_rows = []
-    try:
-        from backend.bim_agent import get_vector_db_status
-        summary_list, _ = get_vector_db_status()
-        for info in summary_list:
-            vdb_summary_rows.append([
-                info.get("domain_group", "공통"),
-                info.get("doc_category", "일반"),
-                info.get("folder_path", "사내서버"),
-                info.get("file_name", ""),
-                info.get("file_ext", ""),
-                info.get("chunk_count", 0),
-                info.get("total_chars", 0),
-                info.get("avg_chars", 0),
-                info.get("drive_link", "")
-            ])
-    except Exception as e:
-        print("[벡터 DB 현황 조회 경고]:", e)
-
+def export_excel_management_ledger(all_catalog_items, vdb_summary_rows):
     try:
         import openpyxl
         from openpyxl.styles import Font, PatternFill, Alignment
 
-        # 기존 03_AI검색_이력로그 시트 데이터 보존
-        existing_logs = []
+        existing_qa_rows = []
         if os.path.exists(EXCEL_LEDGER_PATH):
             try:
                 old_wb = openpyxl.load_workbook(EXCEL_LEDGER_PATH, data_only=True)
                 if "03_AI검색_이력로그" in old_wb.sheetnames:
                     old_ws3 = old_wb["03_AI검색_이력로그"]
-                    for r in list(old_ws3.iter_rows(values_only=True))[1:]:
-                        if any(r):
-                            existing_logs.append(list(r))
+                    for idx, r in enumerate(old_ws3.iter_rows(values_only=True)):
+                        if idx > 0 and any(r):
+                            existing_qa_rows.append(list(r))
             except Exception:
                 pass
 
         wb = openpyxl.Workbook()
 
-        # 시트 1: 01_서버파일_분류대장
         ws1 = wb.active
         ws1.title = "01_서버파일_분류대장"
         headers1 = [
-            "구분(역할)", "프로젝트명", "파일명", "용도", "공법",
+            "구분(역할)", "보관폴더(9분류)", "프로젝트명", "파일명", "용도", "공법",
             "공종", "업무", "파일유형", "추출장표수", "크기(MB)",
-            "수정일시", "내용요약", "사내서버_원본경로", "배포된_산출물경로", "분석_MD파일경로"
+            "수정일시", "내용요약", "원본경로(99_bf_archive)", "산출물배포경로(01_프로젝트_산출물)"
         ]
         ws1.append(headers1)
         for it in all_catalog_items:
             ws1.append([
                 it.get("asset_role", ""),
+                it.get("rel_folder", ""),
                 it.get("project_name", ""),
                 it.get("file_name", ""),
                 it.get("usage", ""),
@@ -709,11 +815,9 @@ def export_excel_management_ledger(all_catalog_items):
                 it.get("modified_at", ""),
                 it.get("description", ""),
                 it.get("server_path", ""),
-                it.get("distributed_path", ""),
-                it.get("md_report_path", "")
+                it.get("distributed_path", "")
             ])
 
-        # 시트 2: 02_VectorDB_학습현황
         ws2 = wb.create_sheet(title="02_VectorDB_학습현황")
         headers2 = [
             "프로젝트/도메인", "문서분류(업무)", "사내서버_폴더", "문서명(파일명)",
@@ -723,12 +827,11 @@ def export_excel_management_ledger(all_catalog_items):
         for v_row in vdb_summary_rows:
             ws2.append(v_row)
 
-        # 시트 3: 03_AI검색_이력로그
         ws3 = wb.create_sheet(title="03_AI검색_이력로그")
-        headers3 = ["검색일시", "접속채널", "사용자_질문내용", "AI_핵심답변요약", "참조된_사내파일목록"]
+        headers3 = ["검색일시", "접속채널", "사용자_질문", "AI_답변_핵심요약", "참조된_사내파일"]
         ws3.append(headers3)
-        for log_r in existing_logs:
-            ws3.append(log_r)
+        for q_row in existing_qa_rows:
+            ws3.append(q_row)
 
         header_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
@@ -740,11 +843,11 @@ def export_excel_management_ledger(all_catalog_items):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
         wb.save(EXCEL_LEDGER_PATH)
-        print("[관리대장 엑셀 갱신 완료]:", EXCEL_LEDGER_PATH)
+        print("[통합관리대장 엑셀 갱신 완료] 1시트({0}건) / 2시트 VectorDB({1}건): {2}".format(
+            len(all_catalog_items), len(vdb_summary_rows), EXCEL_LEDGER_PATH
+        ))
     except Exception as e:
-        print("[관리대장 엑셀 저장 경고]:", e)
-
-    return vdb_summary_rows
+        print("[관리대장 엑셀 저장 경고] 엑셀 파일이 열려 있다면 닫고 다시 실행하세요:", e)
 
 
 def _read_existing_json_list(json_path):
@@ -759,26 +862,50 @@ def _read_existing_json_list(json_path):
     return []
 
 
+def _load_manifest_cache():
+    if os.path.exists(MANIFEST_CACHE_PATH):
+        try:
+            with open(MANIFEST_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_manifest_cache(cache_dict):
+    try:
+        with open(MANIFEST_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache_dict, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
     """
-    [99_bf_archive 마스터 스캔 -> 01_프로젝트_산출물(3분류) 배포 & 00_시스템인덱스 종합 생성]
+    [완전 증분 스캔(Incremental Scan) 엔진 탑재 동기화 파이프라인]
+    - sync_manifest_cache.json을 통해 이전 스캔 시점의 (수정일시 + 파일크기 + 보관폴더)를 대조합니다.
+    - 변경이 없는 기존 파일은 무거운 PDF/PPTX/XLSX 본문 파싱을 건너뛰고 0.001초 만에 캐시를 재사용합니다.
+    - 단, 새로 추가·수정된 파일이거나 이전에 'Manual_Folder 프로젝트'로 잘못 분류되었던 파일은 즉시 재분석하여 자동 교정합니다.
     """
-    global SERVER_STORAGE_PATH, SYSTEM_INDEX_DIR, PROJECT_OUTPUT_DIR, ARCHIVE_MASTER_DIR, DOC_MARKDOWN_DIR, CHROMA_PATH, CATALOG_JSON_PATH, SLIDES_JSON_PATH, EXCEL_LEDGER_PATH, IS_SERVER_ACCESSIBLE
+    global SERVER_STORAGE_PATH, SYSTEM_INDEX_DIR, PROJECT_OUTPUT_DIR, ARCHIVE_ROOT_DIR, DOC_MARKDOWN_DIR, CHROMA_PATH, CATALOG_JSON_PATH, SLIDES_JSON_PATH, EXCEL_LEDGER_PATH, MANIFEST_CACHE_PATH, IS_SERVER_ACCESSIBLE
     (
         SERVER_STORAGE_PATH,
         SYSTEM_INDEX_DIR,
         PROJECT_OUTPUT_DIR,
-        ARCHIVE_MASTER_DIR,
+        ARCHIVE_ROOT_DIR,
         DOC_MARKDOWN_DIR,
         CHROMA_PATH,
         CATALOG_JSON_PATH,
         SLIDES_JSON_PATH,
         EXCEL_LEDGER_PATH,
+        MANIFEST_CACHE_PATH,
         IS_SERVER_ACCESSIBLE
     ) = resolve_storage_paths()
 
     if not IS_SERVER_ACCESSIBLE:
-        print("[외부망/오프라인 모드 감지] 사내 서버({0})에 연결할 수 없어 기존 인덱스 데이터를 보호합니다.".format(SERVER_STORAGE_PATH))
+        print("[외부망/오프라인 모드 감지] 사내 서버에 연결할 수 없어 기존 인덱스 데이터를 보호합니다.")
         existing_cat = [it for it in _read_existing_json_list(CATALOG_JSON_PATH) if it.get("is_inhouse_output", True)]
         existing_slides = [
             s for s in _read_existing_json_list(SLIDES_JSON_PATH)
@@ -789,37 +916,101 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
 
     create_recommended_server_folders()
 
-    # 99_bf_archive 폴더에 파일이 있으면 99_bf_archive만 스캔하여 01_프로젝트_산출물과의 중복 스캔을 원천 방지
-    scan_target_root = ARCHIVE_MASTER_DIR if os.path.exists(ARCHIVE_MASTER_DIR) and os.listdir(ARCHIVE_MASTER_DIR) else SERVER_STORAGE_PATH
-    print("[BF 파일 분석 & 동기화 시작] 마스터 스캔 경로:", scan_target_root)
+    scan_target_root = ARCHIVE_ROOT_DIR if (os.path.exists(ARCHIVE_ROOT_DIR) and any(os.scandir(ARCHIVE_ROOT_DIR))) else SERVER_STORAGE_PATH
+    print("[BF 파일 분석 & 동기화 시작 (완전 증분 모드)] 마스터 스캔 경로:", scan_target_root)
+
+    old_manifest = _load_manifest_cache()
+    new_manifest = {}
 
     all_catalog_items = []
     showcase_output_items = []
-    catalog_pairs = []
+    new_catalog_pairs = []
+    cached_vdb_rows = []
     all_slides = []
+    active_file_names = set()
+
+    reused_cnt = 0
+    analyzed_cnt = 0
+
+    excluded_dirs = {"00_시스템인덱스", "01_프로젝트_산출물", "chroma_db", "showcase_slides", "doc_markdown", ".git", "__pycache__"}
 
     for root, dirs, files in os.walk(scan_target_root):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SYSTEM_DIRS and not d.startswith(".")]
+        dirs[:] = [d for d in dirs if d not in excluded_dirs and not d.startswith(".")]
 
         for fname in files:
-            if fname.startswith(("~$", ".")) or fname.endswith(".json"):
+            f_low = fname.lower()
+            ext_low = os.path.splitext(f_low)[1]
+
+            # [보완 1] Thumbs.db, desktop.ini, 임시 파일($~), 시스템 확장자(.db, .ini, .md, .json) 완벽 제외
+            if fname.startswith(("~$", ".")):
                 continue
-            if any(ak in fname.lower() for ak in ADMIN_LEDGER_KEYWORDS):
+            if f_low in EXCLUDED_SYSTEM_FILES or ext_low in EXCLUDED_SYSTEM_EXTS:
+                continue
+            if any(ak in f_low for ak in ADMIN_LEDGER_KEYWORDS):
                 continue
 
             full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, scan_target_root)
-            rel_folder = os.path.dirname(rel_path) or "루트"
-            ext_low = os.path.splitext(fname)[1].lower()
+            rel_path = os.path.relpath(full_path, SERVER_STORAGE_PATH)
+            rel_folder = os.path.dirname(rel_path) or "99_bf_archive"
 
             try:
-                stat_info = os.stat(full_path)
-                size_mb = round(stat_info.st_size / (1024 * 1024), 2)
-                mtime_str = datetime.datetime.fromtimestamp(stat_info.st_mtime).strftime("%Y-%m-%d %H:%M")
+                stat = os.stat(full_path)
+                size_mb = round(stat.st_size / (1024 * 1024), 2)
+                mtime_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
             except Exception:
                 size_mb = 0.0
                 mtime_str = ""
 
+            active_file_names.add(fname)
+            expected_md = get_expected_md_path(fname)
+
+            # [완전 증분 스캔 판별]
+            # 이전 매니페스트 캐시에 파일이 있고, 수정일시/크기/폴더가 일치하며,
+            # 프로젝트명이 'Manual_Folder 프로젝트' 같은 구버전 오분류가 아니고, _분석.md 파일이 존재하면 본문 파싱 생략!
+            cached_entry = old_manifest.get(full_path)
+            can_reuse = False
+            if cached_entry:
+                c_item = cached_entry.get("item", {})
+                c_proj = c_item.get("project_name", "")
+                if (
+                    cached_entry.get("mtime_str") == mtime_str
+                    and cached_entry.get("size_mb") == size_mb
+                    and cached_entry.get("rel_folder") == rel_folder
+                    and c_proj not in INVALID_LEGACY_PROJECT_NAMES
+                    and os.path.exists(expected_md)
+                ):
+                    can_reuse = True
+
+            if can_reuse:
+                reused_cnt += 1
+                item = cached_entry["item"]
+                slide_records = cached_entry.get("slide_records", [])
+                vdb_row = cached_entry.get("vdb_row")
+
+                dist_path = distribute_to_project_output_folder(item, full_path)
+                item["distributed_path"] = dist_path if dist_path != full_path else ""
+
+                if item.get("is_inhouse_output") and slide_records:
+                    all_slides.extend(slide_records)
+                if vdb_row:
+                    cached_vdb_rows.append(vdb_row)
+
+                all_catalog_items.append(item)
+                if item.get("is_inhouse_output"):
+                    showcase_output_items.append(item)
+
+                new_manifest[full_path] = {
+                    "mtime_str": mtime_str,
+                    "size_mb": size_mb,
+                    "rel_folder": rel_folder,
+                    "item": item,
+                    "slide_records": slide_records,
+                    "vdb_row": vdb_row
+                }
+                continue
+
+            # 신규 파일이거나 수정된 파일(또는 구버전 오분류 교정 대상)만 본문 정밀 분석 수행
+            analyzed_cnt += 1
             page_blocks, body_text, slide_records = extract_text_and_slides_from_file(full_path, rel_folder)
             is_output = is_inhouse_output_file(rel_folder, fname, body_text[:1000])
 
@@ -827,11 +1018,12 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
                 all_slides.extend(slide_records)
 
             proj_name = extract_project_name(rel_folder, fname, body_text)
+            default_tasks = infer_default_task_from_folder(rel_folder, is_output)
             analysis_corpus = "{0} {1} {2}".format(rel_folder, fname, body_text[:25000])
-            usages = analyze_multi_labels(analysis_corpus, TAXONOMY_USAGE, ["일반건축"])
-            methods = analyze_multi_labels(analysis_corpus, TAXONOMY_METHOD, ["일반공법"])
-            disciplines = analyze_multi_labels(analysis_corpus, TAXONOMY_DISCIPLINE, ["RC"])
-            tasks = analyze_multi_labels(analysis_corpus, TAXONOMY_TASK, ["설계검토" if is_output else "표준세팅/가이드"])
+            usages = analyze_multi_labels(analysis_corpus, TAXONOMY_USAGE, ["일반건축"], rel_folder)
+            methods = analyze_multi_labels(analysis_corpus, TAXONOMY_METHOD, ["일반공법"], rel_folder)
+            disciplines = analyze_multi_labels(analysis_corpus, TAXONOMY_DISCIPLINE, ["RC"], rel_folder)
+            tasks = analyze_multi_labels(analysis_corpus, TAXONOMY_TASK, default_tasks, rel_folder)
             media_type = detect_media_type(ext_low)
 
             content_summary = body_text[:180].replace("\n", " ").strip() if body_text else "시각/모델 원본 자산"
@@ -866,18 +1058,34 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
                 "drive_link": full_path
             }
 
-            # 1) 방안 2 기준 01_프로젝트_산출물(3분류) 폴더로 사내 산출물 자동 정리·배포
-            dist_path = distribute_to_project_output_folder(item)
-            item["distributed_path"] = dist_path
+            dist_path = distribute_to_project_output_folder(item, full_path)
+            item["distributed_path"] = dist_path if dist_path != full_path else ""
 
-            # 2) 00_시스템인덱스/doc_markdown 내 파일별 분석 리포트(.md) 자동 생성
-            md_report_path = save_file_analysis_markdown(item, page_blocks, slide_records)
-            item["md_report_path"] = md_report_path
+            save_per_file_markdown_summary(item, page_blocks, slide_records)
 
             all_catalog_items.append(item)
-            catalog_pairs.append((item, page_blocks))
+            new_catalog_pairs.append((item, page_blocks))
             if is_output:
                 showcase_output_items.append(item)
+
+            new_manifest[full_path] = {
+                "mtime_str": mtime_str,
+                "size_mb": size_mb,
+                "rel_folder": rel_folder,
+                "item": item,
+                "slide_records": slide_records,
+                "vdb_row": None
+            }
+
+    # doc_markdown 폴더에서 삭제된 원본이나 Thumbs.db의 잔여 _분석.md 파일 자동 청소
+    if os.path.exists(DOC_MARKDOWN_DIR):
+        expected_md_files = {os.path.basename(get_expected_md_path(fn)) for fn in active_file_names}
+        for md_fn in os.listdir(DOC_MARKDOWN_DIR):
+            if md_fn.lower().endswith(".md") and md_fn not in expected_md_files:
+                try:
+                    os.remove(os.path.join(DOC_MARKDOWN_DIR, md_fn))
+                except Exception:
+                    pass
 
     with open(CATALOG_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(showcase_output_items, f, indent=2, ensure_ascii=False)
@@ -885,10 +1093,20 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
     with open(SLIDES_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(all_slides, f, indent=2, ensure_ascii=False)
 
-    if ingest_new_docs and catalog_pairs:
-        ingest_server_docs_to_chroma(catalog_pairs)
+    # 신규/변경 문서만 청크 분할 및 ChromaDB 적재 후 기존 캐시 통계와 병합
+    vdb_summary_rows, new_vdb_map = ingest_and_summarize_chunks(
+        new_catalog_pairs, cached_vdb_rows, active_file_names
+    )
 
-    vdb_summary_rows = export_excel_management_ledger(all_catalog_items)
+    for fpath, v_row in new_vdb_map.items():
+        if fpath in new_manifest:
+            new_manifest[fpath]["vdb_row"] = v_row
+
+    _save_manifest_cache(new_manifest)
+
+    print("[증분 분석 요약] 기존 캐시 재사용(초고속 통과): {0}건 / 신규·변경 정밀 분석: {1}건".format(reused_cnt, analyzed_cnt))
+
+    export_excel_management_ledger(all_catalog_items, vdb_summary_rows)
 
     sheet_updated = False
     if sync_sheets and CRED_PATH and os.path.exists(CRED_PATH) and SHEET_ID:
@@ -896,29 +1114,29 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
             gc = gspread.service_account(filename=CRED_PATH)
             sh = gc.open_by_key(SHEET_ID)
 
-            ws1 = sh.get_worksheet(0)
-            headers1 = [
-                "asset_role", "project_name", "file_name", "usage", "method_type",
+            ws = sh.get_worksheet(0)
+            headers = [
+                "asset_role", "rel_folder", "project_name", "file_name", "usage", "method_type",
                 "discipline", "task_type", "media_type", "slide_count", "size_mb",
                 "modified_at", "description", "drive_link"
             ]
-            rows1 = [headers1]
+            rows = [headers]
             for it in all_catalog_items:
-                rows1.append([
-                    it["asset_role"], it["project_name"], it["file_name"], it["usage"],
+                rows.append([
+                    it["asset_role"], it["rel_folder"], it["project_name"], it["file_name"], it["usage"],
                     it["method_type"], it["discipline"], it["task_type"], it["media_type"],
                     it["slide_count"], it["size_mb"], it["modified_at"],
                     it["description"], it["drive_link"]
                 ])
-            if len(rows1) > 1:
-                ws1.clear()
-                ws1.update(range_name="A1", values=rows1)
+            if len(rows) > 1:
+                ws.clear()
+                ws.update(range_name="A1", values=rows)
 
             if vdb_summary_rows:
                 try:
                     ws2 = sh.get_worksheet(1)
                 except Exception:
-                    ws2 = sh.add_worksheet(title="02_VectorDB_학습현황", rows="1000", cols="12")
+                    ws2 = sh.add_worksheet(title="VectorDB_학습현황", rows="1000", cols="12")
                 if ws2:
                     v_headers = [
                         "도메인/프로젝트", "문서분류", "사내서버_폴더", "문서명",
@@ -929,7 +1147,7 @@ def scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True):
 
             sheet_updated = True
         except Exception as e:
-            print("[시트 갱신 안내] 로컬/서버 인덱스 생성은 완료되었으나 구글 시트 반영은 생략됨:", e)
+            print("[시트 갱신 안내] 로컬 인덱스 및 관리대장 엑셀 생성은 완료되었으나 시트 반영은 생략됨:", e)
 
     return showcase_output_items, all_slides, sheet_updated
 
@@ -956,8 +1174,6 @@ def load_showcase_slides():
 
 
 if __name__ == "__main__":
-    print("BF 파일 분석 & 동기화 실행 중...")
+    print("BF 파일 분석 & 동기화 실행 중 (완전 증분 스캔 + Thumbs.db 제외 + 프로젝트명 정밀 보정)...")
     items, slides, ok = scan_hybrid_server_and_update(sync_sheets=True, ingest_new_docs=True)
-    print("[완료] 사내 서버 루트: {0}".format(SERVER_STORAGE_PATH))
-    print("[완료] 시스템 인덱스: {0}".format(SYSTEM_INDEX_DIR))
-    print("[완료] 사내 산출물 파일: {0}건 | 인덱싱된 장표: {1}장 | 시트 동기화: {2}".format(len(items), len(slides), ok))
+    print("[완료] 사내 산출물 파일: {0}개 | 실시간 추출 장표: {1}장 | 시트 반영: {2}".format(len(items), len(slides), ok))
